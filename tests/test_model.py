@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from coding_agent.errors import ModelProtocolError
+from coding_agent.model import DeepSeekV4ProClient, parse_openai_message
+
+
+def sdk_message(
+    *,
+    content: str | None = None,
+    arguments: str = "{}",
+    reasoning_content: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=content,
+        reasoning_content=reasoning_content,
+        tool_calls=[
+            SimpleNamespace(
+                id="call-1",
+                function=SimpleNamespace(name="read_file", arguments=arguments),
+            )
+        ],
+    )
+
+
+class OpenAIMessageParserTests(unittest.TestCase):
+    def test_parses_native_tool_call(self) -> None:
+        response = parse_openai_message(
+            sdk_message(arguments='{"path":"README.md","start_line":1}')
+        )
+
+        self.assertEqual(response.tool_calls[0].name, "read_file")
+        self.assertEqual(response.tool_calls[0].arguments["path"], "README.md")
+
+    def test_preserves_deepseek_reasoning_content(self) -> None:
+        response = parse_openai_message(
+            sdk_message(reasoning_content="Need to inspect the repository.")
+        )
+
+        self.assertEqual(
+            response.assistant_message["reasoning_content"],
+            "Need to inspect the repository.",
+        )
+
+    def test_rejects_invalid_json_arguments(self) -> None:
+        with self.assertRaisesRegex(ModelProtocolError, "invalid JSON"):
+            parse_openai_message(sdk_message(arguments="{not-json}"))
+
+    def test_rejects_non_object_arguments(self) -> None:
+        with self.assertRaisesRegex(ModelProtocolError, "JSON object"):
+            parse_openai_message(sdk_message(arguments='["README.md"]'))
+
+    def test_deepseek_client_sends_thinking_configuration(self) -> None:
+        captured_client: dict[str, object] = {}
+        captured_request: dict[str, object] = {}
+
+        class FakeCompletions:
+            def create(self, **request: object) -> SimpleNamespace:
+                captured_request.update(request)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(
+                        content="Done",
+                        reasoning_content="Reasoned",
+                        tool_calls=None,
+                    ))]
+                )
+
+        def fake_openai(**kwargs: object) -> SimpleNamespace:
+            captured_client.update(kwargs)
+            return SimpleNamespace(
+                chat=SimpleNamespace(completions=FakeCompletions())
+            )
+
+        fake_module = SimpleNamespace(OpenAI=fake_openai)
+        with patch.dict(sys.modules, {"openai": fake_module}):
+            client = DeepSeekV4ProClient(api_key="test-key")
+            response = client.generate([], [], timeout_s=12)
+
+        self.assertEqual(captured_client["base_url"], "https://api.deepseek.com")
+        self.assertEqual(captured_request["model"], "deepseek-v4-pro")
+        self.assertEqual(captured_request["reasoning_effort"], "high")
+        self.assertEqual(
+            captured_request["extra_body"],
+            {"thinking": {"type": "enabled"}},
+        )
+        self.assertEqual(response.assistant_message["reasoning_content"], "Reasoned")
+
+
+if __name__ == "__main__":
+    unittest.main()
