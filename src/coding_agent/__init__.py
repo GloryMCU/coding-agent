@@ -3,6 +3,7 @@
 from .agent import Agent, AgentConfig, AgentResult
 from .conversation import ConversationState
 from .context import ContextBuilder, ContextConfig
+from .events import CompositeEventSink
 from .model import (
     DeepSeekV4ProClient,
     ModelClient,
@@ -27,6 +28,7 @@ __all__ = [
     "AgentResult",
     "AllowAllApprovalPolicy",
     "ApprovalPolicy",
+    "CompositeEventSink",
     "ConversationState",
     "ContextBuilder",
     "ContextConfig",

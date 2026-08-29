@@ -12,6 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 deepseek = ["openai>=1.0"]
+tui = ["textual>=1.0"]
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"

@@ -9,7 +9,7 @@ from typing import Any
 from coding_agent.agent import Agent, AgentConfig
 from coding_agent.conversation import Message
 from coding_agent.errors import LoopDetected, MaxStepsExceeded, ModelRequestError
-from coding_agent.events import JsonlEventSink
+from coding_agent.events import CompositeEventSink, JsonlEventSink
 from coding_agent.model import ModelResponse, ToolCall
 from coding_agent.tools import create_read_only_registry, create_workspace_registry
 
@@ -31,6 +31,14 @@ class FakeModel:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class RecordingEventSink:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(self, event_type: str, payload: dict[str, Any]) -> None:
+        self.events.append((event_type, payload))
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -183,6 +191,16 @@ class AgentLoopTests(unittest.TestCase):
             ["user_message", "model_response", "agent_terminated"],
         )
         self.assertEqual(events[-1]["payload"]["reason"], "final_response")
+
+    def test_composite_event_sink_fans_out_in_order(self) -> None:
+        first = RecordingEventSink()
+        second = RecordingEventSink()
+        sink = CompositeEventSink(first, second)
+
+        sink.emit("example", {"value": 42})
+
+        self.assertEqual(first.events, [("example", {"value": 42})])
+        self.assertEqual(second.events, first.events)
 
 
 if __name__ == "__main__":

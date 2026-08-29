@@ -19,6 +19,19 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.context_summary_tokens, 2_000)
         self.assertEqual(args.history_search_limit, 5)
         self.assertEqual(args.approval_mode, "ask")
+        self.assertFalse(args.interactive)
+        self.assertFalse(args.plain)
+
+    def test_prompt_is_optional_for_interactive_mode(self) -> None:
+        args = build_parser().parse_args(["--workspace", "."])
+
+        self.assertIsNone(args.prompt)
+
+    def test_interactive_mode_accepts_an_initial_prompt(self) -> None:
+        args = build_parser().parse_args(["--interactive", "Inspect README.md"])
+
+        self.assertTrue(args.interactive)
+        self.assertEqual(args.prompt, "Inspect README.md")
 
 
 if __name__ == "__main__":

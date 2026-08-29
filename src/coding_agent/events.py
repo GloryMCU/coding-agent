@@ -19,6 +19,20 @@ class NullEventSink:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class CompositeEventSink:
+    """Fan out each event to multiple presentation and audit sinks."""
+
+    sinks: tuple[EventSink, ...]
+
+    def __init__(self, *sinks: EventSink) -> None:
+        object.__setattr__(self, "sinks", tuple(sinks))
+
+    def emit(self, event_type: str, payload: dict[str, Any]) -> None:
+        for sink in self.sinks:
+            sink.emit(event_type, payload)
+
+
 @dataclass(slots=True)
 class JsonlEventSink:
     path: Path

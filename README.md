@@ -7,11 +7,14 @@
 当前版本提供文件读取/搜索/枚举、工作区修改、只读 Git、受控命令执行和项目验证。
 `list_files` / `glob_files` 遵循 `.gitignore`；`git_status`、`git_diff`、
 `git_log` 不开放 Git 写操作；文件变更与进程执行统一经过权限和用户审批策略。
+可选的 Textual 终端界面提供多轮输入、工具活动、Markdown 回答和审批弹窗，同时
+保留适合脚本与 CI 的一次性文本模式。
 
 ## 架构
 
 ```text
 用户请求
+  -> plain CLI / Textual TUI（同一套 Agent API）
   -> Agent.run（本地循环与终止策略）
   -> DeepSeekV4ProClient（OpenAI 兼容传输层）
   -> 模型返回原生 tool_calls
@@ -19,6 +22,7 @@
   -> 读取 / Git / 修改 / 命令 / 验证工具（路径沙箱 + 用户审批）
   -> assistant/tool 状态事务写入本地 SQLite
   -> ContextBuilder 从 SQLite 投影模型消息
+  -> EventSink 同步到审计日志和终端界面
   -> 再次调用模型，直到得到最终文本
 ```
 
@@ -57,7 +61,7 @@ OpenAI Python 客户端作为 HTTP/API 传输层，不使用任何 Agent SDK：
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-python -m pip install -e ".[deepseek]"
+python -m pip install -e ".[deepseek,tui]"
 ```
 
 设置模型配置：
@@ -72,10 +76,23 @@ $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 仓库也提供 `.env.example` 作为变量名称示例，但程序不会自动读取 `.env`，避免
 偷偷引入配置框架；请通过进程环境或你自己的密钥管理系统注入密钥。
 
-运行任务：
+不提供任务参数时进入交互式终端界面：
+
+```powershell
+coding-agent --workspace .
+```
+
+提供任务参数时保持一次性文本模式：
 
 ```powershell
 coding-agent --workspace . "读取 README.md，并说明这个项目的用途"
+```
+
+也可以带着初始任务进入终端界面，或显式要求纯文本输出：
+
+```powershell
+coding-agent --interactive --workspace . "先检查当前 Git 改动"
+coding-agent --plain --workspace . "只输出项目摘要"
 ```
 
 默认配置固定使用 `deepseek-v4-pro`、思考模式和 `high` reasoning effort。可以
@@ -92,8 +109,35 @@ coding-agent --approval-mode allow --workspace . "运行测试并修复失败"
 ```
 
 `--approval-mode` 默认是 `ask`：每次文件写入、补丁、永久删除或命令执行都会在
-终端显示具体操作，并只允许单次确认。`deny` 适合完全只读的无人值守分析；`allow`
+终端显示具体操作，并只允许单次确认；交互界面使用不会阻塞页面的审批弹窗。`deny`
+适合完全只读的无人值守分析；`allow`
 仅适合已经信任任务和仓库的自动化环境。读取、文件枚举和专用只读 Git 工具不提示。
+
+## 交互式终端界面
+
+初版 TUI 保持单栏布局，以便在普通 80×24 终端和 Windows Terminal 中使用：
+
+```text
+Header：coding-agent 与时钟
+Context：workspace、model、approval、session
+Conversation：用户消息、Markdown 回答、reasoning 摘要、工具状态
+Activity：当前运行阶段
+Prompt：多行任务编辑器
+Footer：快捷键
+```
+
+快捷键和本地命令：
+
+- `Ctrl+Enter` 或 `Ctrl+S`：发送任务；
+- `Ctrl+L`：清空当前界面，不删除 SQLite 历史；
+- `Ctrl+Q`：退出；
+- `/new`：开始一个新的持久化会话；
+- `/clear`、`/help`、`/exit`：清屏、帮助和退出。
+
+同步的 `Agent.run` 在 Textual 线程 Worker 中执行，模型和工具事件通过
+`TuiEventSink` 回到 UI 线程；`TuiApprovalPolicy` 只阻塞 Agent Worker，并用 Future
+等待审批弹窗。审计事件仍同时写入 JSONL。这个桥接层接受任意字符串事件类型，后续
+加入 `text_delta`、`tool_output_delta` 和取消事件时无需重写页面启动逻辑。
 
 思考模式产生工具调用时，适配器会把 DeepSeek 返回的 `reasoning_content`
 原样保存在 assistant 消息中，并在下一轮请求中带回。Agent 不解析或执行其中内容。
@@ -200,6 +244,9 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 ```
 
+未安装 `tui` 可选依赖时，核心测试仍可运行，TUI 测试会跳过；安装后使用 Textual
+`run_test()` 在无头终端中验证布局、后台 Worker、消息渲染和审批弹窗。
+
 测试覆盖：
 
 - 工具调用、结果回传和最终响应
@@ -221,10 +268,13 @@ python -m unittest discover -s tests -v
 - 上下文预算、完整轮次裁剪和结构化摘要持久化
 - FTS5 迁移回填、自动索引同步、会话/序号过滤和相关历史召回
 - 工具调用状态转换、幂等领取和中断恢复
+- plain/interactive CLI 参数兼容
+- Textual 页面挂载、后台执行、响应渲染、本地命令和审批弹窗
 
 ## 当前边界
 
 - CLI 支持使用 `--session-id` 继续历史会话；尚未提供会话列表命令
+- TUI 当前按完整模型响应更新，尚未提供 token/命令输出流式显示和进程取消
 - 命令白名单和审批降低风险，但不是操作系统级容器；不可信仓库仍应在隔离环境运行
 - 非 Git 目录的 `.gitignore` 回退覆盖常见规则，完整 Git 语义以 Git 工作区为准
 - 上下文 Token 数使用无第三方 tokenizer 的保守估算，不是厂商精确计数
@@ -233,5 +283,6 @@ python -m unittest discover -s tests -v
 - trigram 查询至少需要 3 个字符；更短的缩写不适合单独作为检索词
 - DeepSeek V4 Pro 当前通过 OpenAI 兼容的 Chat Completions 格式调用
 
-下一阶段可以增加操作系统级进程隔离、可持久化的审批规则，以及更细粒度的网络权限；
-历史量明显增长且关键词召回不足后，再评估向量语义检索与混合排序。
+下一阶段优先增加模型/命令流式事件、取消令牌和会话选择器；之后再增加操作系统级
+进程隔离、可持久化审批规则和更细粒度的网络权限。历史量明显增长且关键词召回不足
+后，再评估向量语义检索与混合排序。
