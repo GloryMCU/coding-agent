@@ -18,6 +18,7 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.max_context_tokens, 24_000)
         self.assertEqual(args.context_summary_tokens, 2_000)
         self.assertEqual(args.history_search_limit, 5)
+        self.assertEqual(args.approval_mode, "ask")
 
 
 if __name__ == "__main__":

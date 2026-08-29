@@ -10,6 +10,14 @@ from .model import (
     OpenAIChatClient,
     ToolCall,
 )
+from .permissions import (
+    AllowAllApprovalPolicy,
+    ApprovalPolicy,
+    DenyApprovalPolicy,
+    InteractiveApprovalPolicy,
+    PermissionKind,
+    PermissionRequest,
+)
 from .tools import ToolRegistry, create_read_only_registry, create_workspace_registry
 from .storage import HistorySearchResult, SqliteConversationStore
 
@@ -17,14 +25,20 @@ __all__ = [
     "Agent",
     "AgentConfig",
     "AgentResult",
+    "AllowAllApprovalPolicy",
+    "ApprovalPolicy",
     "ConversationState",
     "ContextBuilder",
     "ContextConfig",
     "DeepSeekV4ProClient",
+    "DenyApprovalPolicy",
     "HistorySearchResult",
+    "InteractiveApprovalPolicy",
     "ModelClient",
     "ModelResponse",
     "OpenAIChatClient",
+    "PermissionKind",
+    "PermissionRequest",
     "ToolCall",
     "ToolRegistry",
     "SqliteConversationStore",

@@ -32,3 +32,7 @@ class ToolArgumentsError(ToolError):
 class WorkspaceAccessError(ToolError):
     """A tool attempted to access a path outside the workspace."""
 
+
+class PermissionDenied(ToolError):
+    """A local permission policy rejected a tool operation."""
+

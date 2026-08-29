@@ -27,6 +27,14 @@ class WorkspacePolicy:
     def resolve_existing_path(self, raw_path: str) -> Path:
         """Resolve an existing workspace-relative file or directory."""
 
+        candidate = self.resolve_workspace_path(raw_path)
+        if not candidate.exists():
+            raise WorkspaceAccessError(f"path does not exist: {raw_path}")
+        return candidate
+
+    def resolve_workspace_path(self, raw_path: str) -> Path:
+        """Resolve a workspace-relative path without requiring it to exist."""
+
         requested = Path(raw_path)
         if requested.is_absolute():
             raise WorkspaceAccessError("absolute paths are not allowed")
@@ -37,8 +45,6 @@ class WorkspacePolicy:
         except ValueError as exc:
             raise WorkspaceAccessError("path escapes the workspace") from exc
 
-        if not candidate.exists():
-            raise WorkspaceAccessError(f"path does not exist: {raw_path}")
         return candidate
 
     def resolve_mutation_path(self, raw_path: str) -> Path:

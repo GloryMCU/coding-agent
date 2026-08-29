@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -15,13 +16,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .conversation import Message
-from .errors import ToolArgumentsError
+from .errors import PermissionDenied, ToolArgumentsError
+from .execution import (
+    ControlledCommandRunner,
+    discover_verification_plan,
+    run_verification_plan,
+)
 from .model import ToolCall
+from .permissions import (
+    ApprovalPolicy,
+    PermissionKind,
+    PermissionRequest,
+)
 from .policy import WorkspacePolicy
 
 
 JSONSchema = dict[str, Any]
 ToolHandler = Callable[[dict[str, Any]], Any]
+PermissionFactory = Callable[[dict[str, Any]], PermissionRequest]
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +42,7 @@ class ToolDefinition:
     description: str
     parameters: JSONSchema
     handler: ToolHandler
+    permission: PermissionFactory | None = None
 
     def schema(self) -> dict[str, Any]:
         return {
@@ -65,8 +78,9 @@ class ToolExecutionResult:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, approval_policy: ApprovalPolicy | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
+        self._approval_policy = approval_policy
 
     def register(self, definition: ToolDefinition) -> None:
         if definition.name in self._tools:
@@ -88,6 +102,13 @@ class ToolRegistry:
 
         try:
             validate_json_value(definition.parameters, call.arguments, path="arguments")
+            if definition.permission is not None and self._approval_policy is not None:
+                request = definition.permission(call.arguments)
+                if not self._approval_policy.approve(request):
+                    raise PermissionDenied(
+                        f"{request.kind.value} operation was not approved: "
+                        f"{request.description}"
+                    )
             output = definition.handler(call.arguments)
         except Exception as exc:
             return ToolExecutionResult(
@@ -164,6 +185,7 @@ def create_read_only_registry(
     max_file_bytes: int = 64 * 1024,
     max_search_file_bytes: int = 1024 * 1024,
     max_search_output_chars: int = 128 * 1024,
+    approval_policy: ApprovalPolicy | None = None,
 ) -> ToolRegistry:
     if max_file_bytes < 1:
         raise ValueError("max_file_bytes must be >= 1")
@@ -173,7 +195,7 @@ def create_read_only_registry(
         raise ValueError("max_search_output_chars must be >= 1")
 
     policy = WorkspacePolicy(Path(workspace))
-    registry = ToolRegistry()
+    registry = ToolRegistry(approval_policy=approval_policy)
 
     def read_file(arguments: dict[str, Any]) -> dict[str, Any]:
         path = policy.resolve_read_path(arguments["path"])
@@ -226,6 +248,267 @@ def create_read_only_registry(
                 "additionalProperties": False,
             },
             handler=read_file,
+        )
+    )
+
+    def list_files(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_path = arguments.get("path", ".")
+        base = policy.resolve_existing_path(raw_path)
+        if not base.is_dir():
+            raise ToolArgumentsError("path must be a directory")
+        recursive = arguments.get("recursive", False)
+        max_results = arguments.get("max_results", 500)
+        files: list[dict[str, Any]] = []
+        for candidate in _iter_gitignore_visible_files(policy.root):
+            try:
+                relative_to_base = candidate.relative_to(base)
+            except ValueError:
+                continue
+            if not recursive and len(relative_to_base.parts) != 1:
+                continue
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                continue
+            files.append({"path": policy.display_path(candidate), "size": size})
+            if len(files) > max_results:
+                break
+        truncated = len(files) > max_results
+        files = files[:max_results]
+        return {
+            "path": policy.display_path(base),
+            "recursive": recursive,
+            "files": files,
+            "count": len(files),
+            "truncated": truncated,
+            "gitignore_respected": True,
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="list_files",
+            description=(
+                "List files in a workspace directory. Git-tracked files are always "
+                "included and untracked files excluded by .gitignore are omitted."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative directory (default: root)",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "Include descendants (default: false)",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
+                        "description": "Maximum files returned (default: 500)",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=list_files,
+        )
+    )
+
+    def glob_files(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_path = arguments.get("path", ".")
+        base = policy.resolve_existing_path(raw_path)
+        if not base.is_dir():
+            raise ToolArgumentsError("path must be a directory")
+        patterns = arguments["patterns"]
+        if any(not pattern for pattern in patterns):
+            raise ToolArgumentsError("glob patterns must not be empty")
+        max_results = arguments.get("max_results", 500)
+        matches: list[dict[str, Any]] = []
+        for candidate in _iter_gitignore_visible_files(policy.root):
+            try:
+                relative = candidate.relative_to(base).as_posix()
+            except ValueError:
+                continue
+            if not _matches_any_file_pattern(relative, candidate.name, patterns):
+                continue
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                continue
+            matches.append({"path": policy.display_path(candidate), "size": size})
+            if len(matches) > max_results:
+                break
+        truncated = len(matches) > max_results
+        matches = matches[:max_results]
+        return {
+            "path": policy.display_path(base),
+            "patterns": patterns,
+            "files": matches,
+            "count": len(matches),
+            "truncated": truncated,
+            "gitignore_respected": True,
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="glob_files",
+            description=(
+                "Find workspace files matching one or more glob patterns while "
+                "respecting repository .gitignore rules."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative directory (default: root)",
+                    },
+                    "patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
+                        "description": "Maximum files returned (default: 500)",
+                    },
+                },
+                "required": ["patterns"],
+                "additionalProperties": False,
+            },
+            handler=glob_files,
+        )
+    )
+
+    git_runner = ControlledCommandRunner(policy.root, max_output_chars=128 * 1024)
+
+    def git_status(arguments: dict[str, Any]) -> dict[str, Any]:
+        argv = ["git", "-c", "core.fsmonitor=false", "status", "--short", "--branch"]
+        argv.append(
+            "--untracked-files=all"
+            if arguments.get("include_untracked", True)
+            else "--untracked-files=no"
+        )
+        return git_runner.run(argv, timeout_s=30)
+
+    registry.register(
+        ToolDefinition(
+            name="git_status",
+            description="Show read-only Git branch and working-tree status.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "include_untracked": {
+                        "type": "boolean",
+                        "description": "Include all untracked files (default: true)",
+                    }
+                },
+                "additionalProperties": False,
+            },
+            handler=git_status,
+        )
+    )
+
+    def git_diff(arguments: dict[str, Any]) -> dict[str, Any]:
+        argv = [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+        ]
+        if arguments.get("staged", False):
+            argv.append("--cached")
+        argv.append(f"--unified={arguments.get('context_lines', 3)}")
+        paths = arguments.get("paths", [])
+        if paths:
+            normalized_paths = [
+                policy.display_path(policy.resolve_workspace_path(raw_path))
+                for raw_path in paths
+            ]
+            argv.extend(["--", *normalized_paths])
+        return git_runner.run(argv, timeout_s=30)
+
+    registry.register(
+        ToolDefinition(
+            name="git_diff",
+            description=(
+                "Show a read-only Git diff for unstaged changes or the index. "
+                "External diff drivers and color output are disabled."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staged": {
+                        "type": "boolean",
+                        "description": "Show staged/index changes (default: false)",
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 50,
+                        "description": "Optional workspace-relative path filters",
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 20,
+                        "description": "Context lines around hunks (default: 3)",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=git_diff,
+        )
+    )
+
+    def git_log(arguments: dict[str, Any]) -> dict[str, Any]:
+        argv = [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "log",
+            "--no-color",
+            "--no-show-signature",
+            "--date=iso-strict",
+            "--pretty=format:%h%x09%ad%x09%an%x09%s",
+            f"--max-count={arguments.get('max_count', 20)}",
+        ]
+        raw_path = arguments.get("path")
+        if raw_path is not None:
+            normalized_path = policy.display_path(
+                policy.resolve_workspace_path(raw_path)
+            )
+            argv.extend(["--", normalized_path])
+        return git_runner.run(argv, timeout_s=30)
+
+    registry.register(
+        ToolDefinition(
+            name="git_log",
+            description="Show bounded read-only Git commit history.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "max_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum commits returned (default: 20)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional workspace-relative history path",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=git_log,
         )
     )
 
@@ -458,6 +741,8 @@ def create_workspace_registry(
     max_search_file_bytes: int = 1024 * 1024,
     max_search_output_chars: int = 128 * 1024,
     max_write_bytes: int = 1024 * 1024,
+    max_command_output_chars: int = 64 * 1024,
+    approval_policy: ApprovalPolicy | None = None,
 ) -> ToolRegistry:
     """Create the full workspace registry, including bounded mutation tools."""
 
@@ -468,6 +753,7 @@ def create_workspace_registry(
         max_file_bytes=max_file_bytes,
         max_search_file_bytes=max_search_file_bytes,
         max_search_output_chars=max_search_output_chars,
+        approval_policy=approval_policy,
     )
     policy = WorkspacePolicy(Path(workspace))
 
@@ -543,6 +829,11 @@ def create_workspace_registry(
                 "additionalProperties": False,
             },
             handler=write_file,
+            permission=lambda arguments: PermissionRequest(
+                tool_name="write_file",
+                kind=PermissionKind.WRITE,
+                description=f"write workspace file {arguments['path']!r}",
+            ),
         )
     )
 
@@ -630,6 +921,11 @@ def create_workspace_registry(
                 "additionalProperties": False,
             },
             handler=apply_patch,
+            permission=lambda arguments: PermissionRequest(
+                tool_name="apply_patch",
+                kind=PermissionKind.WRITE,
+                description=f"modify workspace file {arguments['path']!r}",
+            ),
         )
     )
 
@@ -687,6 +983,123 @@ def create_workspace_registry(
                 "additionalProperties": False,
             },
             handler=delete_file,
+            permission=lambda arguments: PermissionRequest(
+                tool_name="delete_file",
+                kind=PermissionKind.DELETE,
+                description=f"permanently delete workspace file {arguments['path']!r}",
+            ),
+        )
+    )
+
+    command_runner = ControlledCommandRunner(
+        policy.root, max_output_chars=max_command_output_chars
+    )
+
+    def command_permission(arguments: dict[str, Any]) -> PermissionRequest:
+        argv = command_runner.validate(
+            arguments["argv"], cwd=arguments.get("cwd", ".")
+        )
+        return PermissionRequest(
+            tool_name="run_command",
+            kind=PermissionKind.EXECUTE,
+            description=(
+                f"run argv={argv!r} in cwd={arguments.get('cwd', '.')!r}"
+            ),
+        )
+
+    def run_command(arguments: dict[str, Any]) -> dict[str, Any]:
+        return command_runner.run(
+            arguments["argv"],
+            cwd=arguments.get("cwd", "."),
+            timeout_s=arguments.get("timeout_s", 120),
+        )
+
+    registry.register(
+        ToolDefinition(
+            name="run_command",
+            description=(
+                "Run an approved allowlisted development command with structured "
+                "argv. There is no implicit shell parsing; cwd stays inside the "
+                "workspace and runtime/output are bounded."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "description": (
+                            "Program and arguments, for example "
+                            "['python', '-m', 'unittest']"
+                        ),
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Workspace-relative working directory",
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300,
+                        "description": "Command timeout in seconds (default: 120)",
+                    },
+                },
+                "required": ["argv"],
+                "additionalProperties": False,
+            },
+            handler=run_command,
+            permission=command_permission,
+        )
+    )
+
+    def verification_permission(arguments: dict[str, Any]) -> PermissionRequest:
+        plan = discover_verification_plan(
+            policy.root, arguments.get("kind", "all")
+        )
+        rendered = "; ".join(repr(list(command.argv)) for command in plan)
+        return PermissionRequest(
+            tool_name="verify_project",
+            kind=PermissionKind.EXECUTE,
+            description=rendered or "inspect verification configuration (no command detected)",
+        )
+
+    def verify_project(arguments: dict[str, Any]) -> dict[str, Any]:
+        return run_verification_plan(
+            command_runner,
+            policy.root,
+            kind=arguments.get("kind", "all"),
+            timeout_s=arguments.get("timeout_s", 180),
+        )
+
+    registry.register(
+        ToolDefinition(
+            name="verify_project",
+            description=(
+                "Detect and run repository-native test, build, and formatting-check "
+                "commands. Checks are non-interactive, stop on first failure, and "
+                "formatters use check-only modes."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["test", "build", "format_check", "all"],
+                        "description": "Verification category (default: all)",
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300,
+                        "description": "Per-command timeout (default: 180)",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=verify_project,
+            permission=verification_permission,
         )
     )
     return registry
@@ -789,4 +1202,114 @@ def _iter_search_files(search_path: Path) -> Iterator[Path]:
         base = Path(directory)
         for file_name in sorted(file_names):
             yield base / file_name
+
+
+def _iter_gitignore_visible_files(root: Path) -> Iterator[Path]:
+    """Yield tracked and non-ignored files, using Git as the source of truth."""
+
+    try:
+        repository = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        repository = None
+
+    if repository is not None and repository.returncode == 0:
+        top_level = Path(repository.stdout.strip()).resolve()
+        if top_level == root:
+            try:
+                listed = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "ls-files",
+                        "--cached",
+                        "--others",
+                        "--exclude-standard",
+                        "-z",
+                    ],
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+            except (OSError, subprocess.SubprocessError):
+                listed = None
+            if listed is not None and listed.returncode == 0:
+                for raw_name in sorted(filter(None, listed.stdout.split(b"\0"))):
+                    try:
+                        relative = raw_name.decode("utf-8", errors="surrogateescape")
+                        candidate = (root / relative).resolve(strict=True)
+                        candidate.relative_to(root)
+                    except (OSError, ValueError):
+                        continue
+                    if candidate.is_file():
+                        yield candidate
+                return
+
+    # A workspace need not itself be a Git repository. This fallback implements
+    # the common .gitignore forms and applies nested files in declaration order.
+    fallback_candidates: list[Path] = []
+    for directory, directory_names, file_names in os.walk(root, followlinks=False):
+        directory_names[:] = sorted(
+            name
+            for name in directory_names
+            if name not in {".git", ".coding-agent"}
+        )
+        base = Path(directory)
+        for file_name in sorted(file_names):
+            candidate = base / file_name
+            if candidate.is_symlink() or _is_ignored_by_files(root, candidate):
+                continue
+            fallback_candidates.append(candidate)
+    yield from sorted(fallback_candidates, key=lambda item: item.relative_to(root).as_posix())
+
+
+def _is_ignored_by_files(root: Path, candidate: Path) -> bool:
+    """Evaluate the common .gitignore pattern forms for the non-Git fallback."""
+
+    ignored = False
+    parents = [root]
+    relative_parent = candidate.parent.relative_to(root)
+    current = root
+    for part in relative_parent.parts:
+        current /= part
+        parents.append(current)
+
+    for rule_base in parents:
+        ignore_file = rule_base / ".gitignore"
+        try:
+            lines = ignore_file.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        relative = candidate.relative_to(rule_base).as_posix()
+        for raw_rule in lines:
+            rule = raw_rule.strip()
+            if not rule or rule.startswith("#"):
+                continue
+            negated = rule.startswith("!")
+            if negated:
+                rule = rule[1:]
+            if not rule:
+                continue
+            directory_only = rule.endswith("/")
+            rule = rule.rstrip("/")
+            if rule.startswith("/"):
+                rule = rule[1:]
+            if "/" in rule:
+                matched = fnmatch(relative, rule)
+                if directory_only:
+                    matched = matched or relative.startswith(rule + "/")
+            else:
+                parts = relative.split("/")
+                matched = any(fnmatch(part, rule) for part in parts)
+                if not directory_only and len(parts) > 1:
+                    matched = matched or fnmatch(parts[-1], rule)
+            if matched:
+                ignored = not negated
+    return ignored
 

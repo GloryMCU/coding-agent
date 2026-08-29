@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from coding_agent.model import ToolCall
+from coding_agent.permissions import DenyApprovalPolicy, PermissionRequest
 from coding_agent.tools import create_read_only_registry, create_workspace_registry
 
 
@@ -192,10 +195,21 @@ class SearchTextToolTests(unittest.TestCase):
         self.assertFalse(escaped.ok)
         self.assertIn("escapes the workspace", escaped.error or "")
 
-    def test_schema_exposes_both_read_only_tools(self) -> None:
+    def test_schema_exposes_read_only_tools(self) -> None:
         names = [schema["function"]["name"] for schema in self.registry.schemas()]
 
-        self.assertEqual(names, ["read_file", "search_text"])
+        self.assertEqual(
+            names,
+            [
+                "read_file",
+                "list_files",
+                "glob_files",
+                "git_status",
+                "git_diff",
+                "git_log",
+                "search_text",
+            ],
+        )
 
 
 class WorkspaceMutationToolTests(unittest.TestCase):
@@ -319,8 +333,242 @@ class WorkspaceMutationToolTests(unittest.TestCase):
 
         self.assertEqual(
             names,
-            ["read_file", "search_text", "write_file", "apply_patch", "delete_file"],
+            [
+                "read_file",
+                "list_files",
+                "glob_files",
+                "git_status",
+                "git_diff",
+                "git_log",
+                "search_text",
+                "write_file",
+                "apply_patch",
+                "delete_file",
+                "run_command",
+                "verify_project",
+            ],
         )
+
+
+class FileDiscoveryToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temporary.name)
+        (self.workspace / ".gitignore").write_text(
+            "*.log\nbuild/\n", encoding="utf-8"
+        )
+        (self.workspace / "visible.py").write_text("pass\n", encoding="utf-8")
+        (self.workspace / "ignored.log").write_text("ignored\n", encoding="utf-8")
+        (self.workspace / "src").mkdir()
+        (self.workspace / "src" / "nested.py").write_text("pass\n", encoding="utf-8")
+        (self.workspace / "build").mkdir()
+        (self.workspace / "build" / "artifact.bin").write_bytes(b"ignored")
+        self.registry = create_read_only_registry(self.workspace)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def execute(self, name: str, **arguments: object):
+        return self.registry.execute(
+            ToolCall(id=f"{name}-1", name=name, arguments=arguments)
+        )
+
+    def test_list_files_respects_gitignore_and_recursion(self) -> None:
+        result = self.execute("list_files", recursive=True)
+
+        self.assertTrue(result.ok)
+        paths = [item["path"] for item in result.output["files"]]
+        self.assertIn("visible.py", paths)
+        self.assertIn("src/nested.py", paths)
+        self.assertNotIn("ignored.log", paths)
+        self.assertNotIn("build/artifact.bin", paths)
+
+    def test_glob_files_matches_visible_files_only(self) -> None:
+        result = self.execute("glob_files", patterns=["*.py"])
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            [item["path"] for item in result.output["files"]],
+            ["src/nested.py", "visible.py"],
+        )
+
+
+class GitReadOnlyToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temporary.name)
+        subprocess.run(["git", "init", "-q", str(self.workspace)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "config", "user.name", "Test User"],
+            check=True,
+        )
+        (self.workspace / "tracked.txt").write_text("before\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "add", "tracked.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "commit", "-q", "-m", "initial"],
+            check=True,
+        )
+        (self.workspace / "tracked.txt").write_text("after\n", encoding="utf-8")
+        self.registry = create_read_only_registry(self.workspace)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def execute(self, name: str, **arguments: object):
+        return self.registry.execute(ToolCall(id=name, name=name, arguments=arguments))
+
+    def test_status_diff_and_log_are_bounded_read_only_operations(self) -> None:
+        status = self.execute("git_status")
+        diff = self.execute("git_diff", paths=["tracked.txt"])
+        log = self.execute("git_log", max_count=1)
+
+        self.assertTrue(status.ok)
+        self.assertIn("tracked.txt", status.output["stdout"])
+        self.assertTrue(diff.ok)
+        self.assertIn("-before", diff.output["stdout"])
+        self.assertTrue(log.ok)
+        self.assertIn("initial", log.output["stdout"])
+
+    def test_diff_and_log_accept_a_deleted_path(self) -> None:
+        (self.workspace / "tracked.txt").unlink()
+
+        diff = self.execute("git_diff", paths=["tracked.txt"])
+        log = self.execute("git_log", path="tracked.txt", max_count=1)
+
+        self.assertTrue(diff.ok)
+        self.assertIn("deleted file mode", diff.output["stdout"])
+        self.assertTrue(log.ok)
+        self.assertIn("initial", log.output["stdout"])
+
+
+class RecordingApprovalPolicy:
+    def __init__(self, approved: bool) -> None:
+        self.approved = approved
+        self.requests: list[PermissionRequest] = []
+
+    def approve(self, request: PermissionRequest) -> bool:
+        self.requests.append(request)
+        return self.approved
+
+
+class ApprovalAndCommandToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temporary.name)
+        (self.workspace / "input.txt").write_text("safe\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_read_is_unprompted_but_write_requires_approval(self) -> None:
+        policy = RecordingApprovalPolicy(approved=False)
+        registry = create_workspace_registry(
+            self.workspace, approval_policy=policy
+        )
+
+        read = registry.execute(
+            ToolCall(id="read", name="read_file", arguments={"path": "input.txt"})
+        )
+        write = registry.execute(
+            ToolCall(
+                id="write",
+                name="write_file",
+                arguments={"path": "denied.txt", "content": "no\n"},
+            )
+        )
+
+        self.assertTrue(read.ok)
+        self.assertFalse(write.ok)
+        self.assertIn("not approved", write.error or "")
+        self.assertFalse((self.workspace / "denied.txt").exists())
+        self.assertEqual([request.tool_name for request in policy.requests], ["write_file"])
+
+    def test_controlled_command_uses_argv_and_captures_output(self) -> None:
+        policy = RecordingApprovalPolicy(approved=True)
+        registry = create_workspace_registry(
+            self.workspace, approval_policy=policy
+        )
+        result = registry.execute(
+            ToolCall(
+                id="command",
+                name="run_command",
+                arguments={"argv": [sys.executable, "-c", "print('verified')"]},
+            )
+        )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["exit_code"], 0)
+        self.assertEqual(result.output["stdout"], "verified\n")
+        self.assertEqual(policy.requests[0].tool_name, "run_command")
+
+    def test_command_denial_and_powershell_danger_filter(self) -> None:
+        denied = create_workspace_registry(
+            self.workspace, approval_policy=DenyApprovalPolicy()
+        ).execute(
+            ToolCall(
+                id="denied",
+                name="run_command",
+                arguments={"argv": ["python", "--version"]},
+            )
+        )
+        dangerous = create_workspace_registry(
+            self.workspace, approval_policy=RecordingApprovalPolicy(True)
+        ).execute(
+            ToolCall(
+                id="dangerous",
+                name="run_command",
+                arguments={
+                    "argv": ["powershell", "-NoProfile", "-Command", "Remove-Item x"]
+                },
+            )
+        )
+
+        self.assertFalse(denied.ok)
+        self.assertFalse(dangerous.ok)
+        self.assertIn("denied operation", dangerous.error or "")
+
+        git_bypass = create_workspace_registry(
+            self.workspace, approval_policy=RecordingApprovalPolicy(True)
+        ).execute(
+            ToolCall(
+                id="git-bypass",
+                name="run_command",
+                arguments={"argv": ["git", "-c", "color.ui=false", "push"]},
+            )
+        )
+        self.assertFalse(git_bypass.ok)
+        self.assertIn("read-only Git", git_bypass.error or "")
+
+    def test_verify_project_runs_detected_tests(self) -> None:
+        (self.workspace / "pyproject.toml").write_text(
+            "[build-system]\nrequires = []\nbuild-backend = 'setuptools.build_meta'\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "tests").mkdir()
+        (self.workspace / "tests" / "test_sample.py").write_text(
+            "import unittest\n\nclass Sample(unittest.TestCase):\n"
+            "    def test_ok(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        registry = create_workspace_registry(
+            self.workspace, approval_policy=RecordingApprovalPolicy(True)
+        )
+
+        result = registry.execute(
+            ToolCall(
+                id="verify", name="verify_project", arguments={"kind": "test"}
+            )
+        )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.output["ok"], result.output)
+        self.assertEqual(result.output["results"][0]["check"], "test")
 
 
 if __name__ == "__main__":

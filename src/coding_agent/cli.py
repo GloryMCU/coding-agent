@@ -10,6 +10,11 @@ from pathlib import Path
 from .agent import Agent, AgentConfig
 from .events import JsonlEventSink
 from .model import DeepSeekV4ProClient
+from .permissions import (
+    AllowAllApprovalPolicy,
+    DenyApprovalPolicy,
+    InteractiveApprovalPolicy,
+)
 from .storage import SqliteConversationStore
 from .tools import create_workspace_registry
 
@@ -41,6 +46,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable thinking mode (default: enabled)",
     )
     parser.add_argument("--max-steps", type=int, default=10)
+    parser.add_argument(
+        "--approval-mode",
+        choices=("ask", "deny", "allow"),
+        default="ask",
+        help=(
+            "Policy for file changes and command execution: ask, deny, or allow "
+            "(default: ask)"
+        ),
+    )
     parser.add_argument(
         "--max-context-tokens",
         type=int,
@@ -108,9 +122,16 @@ def main() -> int:
         thinking=args.thinking,
         reasoning_effort=args.reasoning_effort,
     )
+    approval_policy = {
+        "ask": InteractiveApprovalPolicy,
+        "deny": DenyApprovalPolicy,
+        "allow": AllowAllApprovalPolicy,
+    }[args.approval_mode]()
     agent = Agent(
         model=model,
-        tools=create_workspace_registry(workspace),
+        tools=create_workspace_registry(
+            workspace, approval_policy=approval_policy
+        ),
         config=AgentConfig(
             max_steps=args.max_steps,
             max_context_tokens=args.max_context_tokens,
