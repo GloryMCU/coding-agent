@@ -1,4 +1,4 @@
-"""One-shot command line entry point for the MVP."""
+"""One-shot command line entry point for the coding agent."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .agent import Agent, AgentConfig
 from .events import JsonlEventSink
 from .model import DeepSeekV4ProClient
 from .storage import SqliteConversationStore
-from .tools import create_read_only_registry
+from .tools import create_workspace_registry
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,6 +41,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable thinking mode (default: enabled)",
     )
     parser.add_argument("--max-steps", type=int, default=10)
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=24_000,
+        help="Approximate model context budget for durable sessions (default: 24000)",
+    )
+    parser.add_argument(
+        "--context-summary-tokens",
+        type=int,
+        default=2_000,
+        help="Maximum share of context used by compacted history (default: 2000)",
+    )
+    parser.add_argument(
+        "--history-search-limit",
+        type=int,
+        default=5,
+        help="FTS5 matches recalled into compacted context (default: 5; 0 disables)",
+    )
     parser.add_argument(
         "--db",
         type=Path,
@@ -92,8 +110,13 @@ def main() -> int:
     )
     agent = Agent(
         model=model,
-        tools=create_read_only_registry(workspace),
-        config=AgentConfig(max_steps=args.max_steps),
+        tools=create_workspace_registry(workspace),
+        config=AgentConfig(
+            max_steps=args.max_steps,
+            max_context_tokens=args.max_context_tokens,
+            context_summary_tokens=args.context_summary_tokens,
+            history_search_limit=args.history_search_limit,
+        ),
         events=JsonlEventSink(event_log_path),
         store=SqliteConversationStore(database_path),
         workspace=workspace,

@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+import stat
+import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable
 
@@ -133,6 +140,14 @@ def validate_json_value(schema: JSONSchema, value: Any, *, path: str) -> None:
                 validate_json_value(properties[key], child, path=f"{path}.{key}")
 
     if expected == "array" and "items" in schema:
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            raise ToolArgumentsError(
+                f"{path} must contain at least {schema['minItems']} items"
+            )
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            raise ToolArgumentsError(
+                f"{path} must contain at most {schema['maxItems']} items"
+            )
         for index, child in enumerate(value):
             validate_json_value(schema["items"], child, path=f"{path}[{index}]")
 
@@ -147,7 +162,16 @@ def create_read_only_registry(
     workspace: str | Path,
     *,
     max_file_bytes: int = 64 * 1024,
+    max_search_file_bytes: int = 1024 * 1024,
+    max_search_output_chars: int = 128 * 1024,
 ) -> ToolRegistry:
+    if max_file_bytes < 1:
+        raise ValueError("max_file_bytes must be >= 1")
+    if max_search_file_bytes < 1:
+        raise ValueError("max_search_file_bytes must be >= 1")
+    if max_search_output_chars < 1:
+        raise ValueError("max_search_output_chars must be >= 1")
+
     policy = WorkspacePolicy(Path(workspace))
     registry = ToolRegistry()
 
@@ -204,5 +228,565 @@ def create_read_only_registry(
             handler=read_file,
         )
     )
+
+    def search_text(arguments: dict[str, Any]) -> dict[str, Any]:
+        query = arguments["query"]
+        if not query:
+            raise ToolArgumentsError("query must not be empty")
+        if len(query) > 500:
+            raise ToolArgumentsError("query must be at most 500 characters")
+
+        raw_search_path = arguments.get("path", ".")
+        search_path = policy.resolve_existing_path(raw_search_path)
+        file_pattern = arguments.get("file_pattern")
+        if file_pattern == "":
+            raise ToolArgumentsError("file_pattern must not be empty")
+        include_patterns = list(arguments.get("include_patterns", []))
+        if file_pattern is not None:
+            include_patterns.append(file_pattern)
+        exclude_patterns = arguments.get("exclude_patterns", [])
+        if any(not item for item in include_patterns + exclude_patterns):
+            raise ToolArgumentsError("file patterns must not be empty")
+
+        case_sensitive = arguments.get("case_sensitive", False)
+        regex = arguments.get("regex", False)
+        context_lines = arguments.get("context_lines", 0)
+        max_results = arguments.get("max_results", 100)
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            pattern = re.compile(query if regex else re.escape(query), flags)
+        except re.error as exc:
+            raise ToolArgumentsError(f"invalid regular expression: {exc}") from exc
+
+        matches: list[dict[str, Any]] = []
+        output_chars = 0
+        output_limit_reached = False
+        files_considered = 0
+        files_searched = 0
+        skipped_binary_files = 0
+        skipped_by_pattern = 0
+        skipped_outside_workspace = 0
+        skipped_unreadable_files = 0
+        truncated_files = 0
+
+        for candidate in _iter_search_files(search_path):
+            files_considered += 1
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(policy.root)
+            except (OSError, ValueError):
+                # Ignore broken links and links that point outside the workspace.
+                skipped_outside_workspace += 1
+                continue
+
+            workspace_relative = candidate.relative_to(policy.root).as_posix()
+            search_relative = (
+                candidate.name
+                if search_path.is_file()
+                else candidate.relative_to(search_path).as_posix()
+            )
+            if include_patterns and not _matches_any_file_pattern(
+                search_relative, candidate.name, include_patterns
+            ):
+                skipped_by_pattern += 1
+                continue
+            if exclude_patterns and _matches_any_file_pattern(
+                search_relative, candidate.name, exclude_patterns
+            ):
+                skipped_by_pattern += 1
+                continue
+
+            try:
+                with resolved.open("rb") as stream:
+                    raw = stream.read(max_search_file_bytes + 1)
+            except OSError:
+                skipped_unreadable_files += 1
+                continue
+            if b"\x00" in raw:
+                skipped_binary_files += 1
+                continue
+
+            files_searched += 1
+            if len(raw) > max_search_file_bytes:
+                truncated_files += 1
+                raw = raw[:max_search_file_bytes]
+            text = raw.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+            for line_index, line in enumerate(lines):
+                for found in pattern.finditer(line):
+                    line_excerpt, excerpt_start = _line_excerpt(line, found.start())
+                    matched_text = found.group(0)
+                    match = {
+                        "path": workspace_relative,
+                        "line_number": line_index + 1,
+                        "column_number": found.start() + 1,
+                        "end_column_number": max(found.end(), found.start() + 1),
+                        "matched_text": matched_text[:500],
+                        "matched_text_truncated": len(matched_text) > 500,
+                        "line": line_excerpt,
+                        "line_start_column": excerpt_start + 1,
+                        "line_truncated": len(line_excerpt) < len(line),
+                        "context": _build_line_context(
+                            lines,
+                            line_index=line_index,
+                            context_lines=context_lines,
+                        ),
+                    }
+                    match_chars = len(json.dumps(match, ensure_ascii=False))
+                    if matches and output_chars + match_chars > max_search_output_chars:
+                        output_limit_reached = True
+                        break
+                    matches.append(match)
+                    output_chars += match_chars
+                    # Read one result beyond the limit so `truncated` is exact.
+                    if len(matches) > max_results:
+                        break
+                if len(matches) > max_results or output_limit_reached:
+                    break
+            if len(matches) > max_results or output_limit_reached:
+                break
+
+        result_limit_reached = len(matches) > max_results
+        truncation_reasons = []
+        if result_limit_reached:
+            truncation_reasons.append("result_limit")
+        if output_limit_reached:
+            truncation_reasons.append("output_size_limit")
+        if truncated_files:
+            truncation_reasons.append("file_size_limit")
+        truncated = bool(truncation_reasons)
+        matches = matches[:max_results]
+        return {
+            "query": query,
+            "path": policy.display_path(search_path),
+            "regex": regex,
+            "case_sensitive": case_sensitive,
+            "include_patterns": include_patterns,
+            "exclude_patterns": exclude_patterns,
+            "matches": matches,
+            "match_count": len(matches),
+            "files_considered": files_considered,
+            "files_searched": files_searched,
+            "skipped_by_pattern": skipped_by_pattern,
+            "skipped_binary_files": skipped_binary_files,
+            "skipped_outside_workspace": skipped_outside_workspace,
+            "skipped_unreadable_files": skipped_unreadable_files,
+            "truncated_files": truncated_files,
+            "truncated": truncated,
+            "truncation_reasons": truncation_reasons,
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="search_text",
+            description=(
+                "Search repository text files for a literal string or regular "
+                "expression. Supports include/exclude globs and surrounding context; "
+                "returns every occurrence with one-based line and column locations."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Literal text or regular expression to search for",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Workspace-relative file or directory to search "
+                            "(default: workspace root)"
+                        ),
+                    },
+                    "file_pattern": {
+                        "type": "string",
+                        "description": (
+                            "Backward-compatible single include glob such as '*.py'"
+                        ),
+                    },
+                    "include_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                        "description": "Optional include globs; any matching glob includes",
+                    },
+                    "exclude_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                        "description": "Optional exclude globs applied after includes",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Whether letter case must match (default: false)",
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description": (
+                            "Interpret query as a Python regular expression "
+                            "(default: false)"
+                        ),
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": (
+                            "Surrounding lines returned for each occurrence (default: 0)"
+                        ),
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Maximum matching lines to return (default: 100)",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            handler=search_text,
+        )
+    )
     return registry
+
+
+def create_workspace_registry(
+    workspace: str | Path,
+    *,
+    max_file_bytes: int = 64 * 1024,
+    max_search_file_bytes: int = 1024 * 1024,
+    max_search_output_chars: int = 128 * 1024,
+    max_write_bytes: int = 1024 * 1024,
+) -> ToolRegistry:
+    """Create the full workspace registry, including bounded mutation tools."""
+
+    if max_write_bytes < 1:
+        raise ValueError("max_write_bytes must be >= 1")
+    registry = create_read_only_registry(
+        workspace,
+        max_file_bytes=max_file_bytes,
+        max_search_file_bytes=max_search_file_bytes,
+        max_search_output_chars=max_search_output_chars,
+    )
+    policy = WorkspacePolicy(Path(workspace))
+
+    def write_file(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_path = arguments["path"]
+        path = policy.resolve_mutation_path(raw_path)
+        content = arguments["content"]
+        encoded = content.encode("utf-8")
+        if len(encoded) > max_write_bytes:
+            raise ToolArgumentsError(
+                f"content exceeds the {max_write_bytes}-byte write limit"
+            )
+
+        existed = path.exists()
+        if existed and not path.is_file():
+            raise ToolArgumentsError(f"path is not a regular file: {raw_path}")
+        overwrite = arguments.get("overwrite", False)
+        if existed and not overwrite:
+            raise ToolArgumentsError(
+                "path already exists; set overwrite=true to replace it explicitly"
+            )
+
+        if not path.parent.exists():
+            if not arguments.get("create_parent_dirs", False):
+                raise ToolArgumentsError(
+                    "parent directory does not exist; set create_parent_dirs=true"
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Re-evaluate the path after creating parents to catch unexpected links.
+            path = policy.resolve_mutation_path(raw_path)
+        if not path.parent.is_dir():
+            raise ToolArgumentsError(f"parent path is not a directory: {raw_path}")
+
+        _atomic_write_bytes(path, encoded, replace=existed and overwrite)
+        return {
+            "path": policy.display_path(path),
+            "created": not existed,
+            "overwritten": existed,
+            "bytes_written": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="write_file",
+            description=(
+                "Create a UTF-8 file in the workspace. Existing files are protected "
+                "unless overwrite=true; prefer apply_patch for focused edits."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative destination file path",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete UTF-8 file content",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Explicitly replace an existing file (default: false)",
+                    },
+                    "create_parent_dirs": {
+                        "type": "boolean",
+                        "description": (
+                            "Create missing parent directories (default: false)"
+                        ),
+                    },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+            handler=write_file,
+        )
+    )
+
+    def apply_patch(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_path = arguments["path"]
+        path = policy.resolve_mutation_path(raw_path)
+        if not path.exists():
+            raise ToolArgumentsError(f"path does not exist: {raw_path}")
+        if not path.is_file():
+            raise ToolArgumentsError(f"path is not a regular file: {raw_path}")
+
+        old_text = arguments["old_text"]
+        new_text = arguments["new_text"]
+        if not old_text:
+            raise ToolArgumentsError("old_text must not be empty")
+        if old_text == new_text:
+            raise ToolArgumentsError("old_text and new_text must be different")
+
+        with path.open("rb") as stream:
+            raw = stream.read(max_write_bytes + 1)
+        if len(raw) > max_write_bytes:
+            raise ToolArgumentsError(
+                f"file exceeds the {max_write_bytes}-byte mutation limit"
+            )
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ToolArgumentsError("file is not valid UTF-8 text") from exc
+
+        expected_replacements = arguments.get("expected_replacements", 1)
+        actual_replacements = content.count(old_text)
+        if actual_replacements != expected_replacements:
+            raise ToolArgumentsError(
+                f"expected {expected_replacements} occurrence(s) of old_text, "
+                f"found {actual_replacements}; file was not changed"
+            )
+
+        updated = content.replace(old_text, new_text)
+        encoded = updated.encode("utf-8")
+        if len(encoded) > max_write_bytes:
+            raise ToolArgumentsError(
+                f"patched content exceeds the {max_write_bytes}-byte mutation limit"
+            )
+        _atomic_write_bytes(path, encoded, replace=True)
+        return {
+            "path": policy.display_path(path),
+            "replacements": actual_replacements,
+            "bytes_before": len(raw),
+            "bytes_after": len(encoded),
+            "sha256_before": hashlib.sha256(raw).hexdigest(),
+            "sha256_after": hashlib.sha256(encoded).hexdigest(),
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="apply_patch",
+            description=(
+                "Modify one UTF-8 workspace file by replacing exact text. The edit "
+                "only succeeds when the occurrence count exactly matches the expected "
+                "count, preventing ambiguous or stale changes."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative existing file path",
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact existing text to replace",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text; may be empty to remove text",
+                    },
+                    "expected_replacements": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Required occurrence count (default: 1)",
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": False,
+            },
+            handler=apply_patch,
+        )
+    )
+
+    def delete_file(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_path = arguments["path"]
+        path = policy.resolve_mutation_path(raw_path)
+        if not path.exists():
+            raise ToolArgumentsError(f"path does not exist: {raw_path}")
+        if not path.is_file():
+            raise ToolArgumentsError(f"path is not a regular file: {raw_path}")
+
+        digest = _sha256_file(path)
+        expected_sha256 = arguments.get("expected_sha256")
+        if expected_sha256 is not None:
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+                raise ToolArgumentsError(
+                    "expected_sha256 must be 64 hexadecimal characters"
+                )
+            if digest != expected_sha256.lower():
+                raise ToolArgumentsError(
+                    "file hash does not match expected_sha256; file was not deleted"
+                )
+
+        size = path.stat().st_size
+        display_path = policy.display_path(path)
+        path.unlink()
+        return {
+            "path": display_path,
+            "deleted": True,
+            "bytes_deleted": size,
+            "sha256": digest,
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="delete_file",
+            description=(
+                "Permanently delete one regular file in the workspace. Directories "
+                "and symbolic links are never deleted. Supply expected_sha256 when "
+                "the file must have specific expected content."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative existing file path",
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "description": "Optional expected lowercase or uppercase SHA-256",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            handler=delete_file,
+        )
+    )
+    return registry
+
+
+def _atomic_write_bytes(path: Path, content: bytes, *, replace: bool) -> None:
+    """Durably stage content beside its destination, then publish it atomically."""
+
+    existing_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_path, existing_mode if existing_mode is not None else 0o644)
+        if replace:
+            os.replace(temporary_path, path)
+        else:
+            try:
+                os.link(temporary_path, path)
+            except FileExistsError as exc:
+                raise ToolArgumentsError(
+                    "path was created concurrently; existing file was not overwritten"
+                ) from exc
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _matches_any_file_pattern(
+    relative_path: str, file_name: str, patterns: list[str]
+) -> bool:
+    return any(
+        fnmatch(relative_path, pattern) or fnmatch(file_name, pattern)
+        for pattern in patterns
+    )
+
+
+def _line_excerpt(line: str, match_start: int, *, limit: int = 500) -> tuple[str, int]:
+    if len(line) <= limit:
+        return line, 0
+    start = max(0, match_start - limit // 3)
+    start = min(start, len(line) - limit)
+    return line[start : start + limit], start
+
+
+def _build_line_context(
+    lines: list[str], *, line_index: int, context_lines: int
+) -> list[dict[str, Any]]:
+    if context_lines == 0:
+        return []
+    start = max(0, line_index - context_lines)
+    end = min(len(lines), line_index + context_lines + 1)
+    return [
+        {
+            "line_number": index + 1,
+            "line": lines[index][:500],
+            "line_truncated": len(lines[index]) > 500,
+            "is_match": index == line_index,
+        }
+        for index in range(start, end)
+    ]
+
+
+def _iter_search_files(search_path: Path) -> Iterator[Path]:
+    """Yield candidate files deterministically without following directory links."""
+
+    if search_path.is_file():
+        yield search_path
+        return
+
+    excluded_directories = {
+        ".coding-agent",
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "venv",
+    }
+    for directory, directory_names, file_names in os.walk(
+        search_path, followlinks=False
+    ):
+        directory_names[:] = sorted(
+            name for name in directory_names if name not in excluded_directories
+        )
+        base = Path(directory)
+        for file_name in sorted(file_names):
+            yield base / file_name
 

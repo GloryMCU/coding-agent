@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -67,6 +68,25 @@ class ToolCallClaim:
     result: ToolExecutionResult | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class StoredContextSummary:
+    session_id: str
+    through_seq: int
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class HistorySearchResult:
+    session_id: str
+    message_id: str
+    part_id: str
+    message_seq: int
+    role: str
+    part_type: str
+    snippet: str
+    rank: float
+
+
 class SqliteConversationStore:
     """The durable source of truth for sessions, messages, and tool states."""
 
@@ -84,14 +104,39 @@ class SqliteConversationStore:
         return connection
 
     def _initialize(self) -> None:
-        migration = (
-            resources.files("coding_agent.migrations")
-            .joinpath("001_initial.sql")
-            .read_text(encoding="utf-8")
-        )
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(migration)
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migration (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.commit()
+
+            migration_root = resources.files("coding_agent.migrations")
+            migrations: list[tuple[int, Any]] = []
+            for resource in migration_root.iterdir():
+                match = re.fullmatch(r"(\d+)_.*\.sql", resource.name)
+                if match is not None:
+                    migrations.append((int(match.group(1)), resource))
+
+            for version, resource in sorted(migrations):
+                applied = connection.execute(
+                    "SELECT 1 FROM schema_migration WHERE version = ?", (version,)
+                ).fetchone()
+                if applied is not None:
+                    continue
+                connection.executescript(resource.read_text(encoding="utf-8"))
+                recorded = connection.execute(
+                    "SELECT 1 FROM schema_migration WHERE version = ?", (version,)
+                ).fetchone()
+                if recorded is None:
+                    raise RuntimeError(
+                        f"migration {resource.name} did not record version {version}"
+                    )
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -335,6 +380,122 @@ class SqliteConversationStore:
             )
             for row in message_rows
         ]
+
+    def get_context_summary(self, session_id: str) -> StoredContextSummary | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM context_summary WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return StoredContextSummary(
+            session_id=row["session_id"],
+            through_seq=row["through_seq"],
+            data=_json_load(row["data_json"]),
+        )
+
+    def save_context_summary(
+        self,
+        session_id: str,
+        *,
+        through_seq: int,
+        data: dict[str, Any],
+    ) -> None:
+        if through_seq < 1:
+            raise ValueError("through_seq must be >= 1")
+        timestamp = _now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO context_summary(
+                    session_id, through_seq, data_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    through_seq = excluded.through_seq,
+                    data_json = excluded.data_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id,
+                    through_seq,
+                    _json_dump(data),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    def search_history(
+        self,
+        query: str,
+        *,
+        session_id: str | None = None,
+        before_seq: int | None = None,
+        limit: int = 10,
+    ) -> list[HistorySearchResult]:
+        """Search durable message parts using a safely quoted FTS5 query."""
+
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        if before_seq is not None and before_seq < 1:
+            raise ValueError("before_seq must be >= 1")
+        match_query = self._compile_fts_query(query)
+        conditions = ["history_fts MATCH ?"]
+        parameters: list[Any] = [match_query]
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            parameters.append(session_id)
+        if before_seq is not None:
+            conditions.append("CAST(message_seq AS INTEGER) <= ?")
+            parameters.append(before_seq)
+        parameters.append(limit)
+
+        sql = f"""
+            SELECT
+                session_id,
+                message_id,
+                part_id,
+                message_seq,
+                role,
+                part_type,
+                snippet(history_fts, 6, '[', ']', ' … ', 24) AS snippet,
+                bm25(history_fts) AS rank
+            FROM history_fts
+            WHERE {' AND '.join(conditions)}
+            ORDER BY rank, CAST(message_seq AS INTEGER) DESC
+            LIMIT ?
+        """
+        with closing(self._connect()) as connection:
+            rows = connection.execute(sql, parameters).fetchall()
+        return [
+            HistorySearchResult(
+                session_id=row["session_id"],
+                message_id=row["message_id"],
+                part_id=row["part_id"],
+                message_seq=int(row["message_seq"]),
+                role=row["role"],
+                part_type=row["part_type"],
+                snippet=row["snippet"],
+                rank=float(row["rank"]),
+            )
+            for row in rows
+        ]
+
+    @staticmethod
+    def _compile_fts_query(query: str) -> str:
+        tokens = re.findall(r"\w+", query, flags=re.UNICODE)
+        if not tokens:
+            raise ValueError("search query must contain text or identifier characters")
+        unique_tokens: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            normalized = token.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_tokens.append(token)
+            if len(unique_tokens) == 16:
+                break
+        return " OR ".join(f'"{token}"' for token in unique_tokens)
 
     def claim_tool_call(self, session_id: str, call_id: str) -> ToolCallClaim:
         with self._transaction() as connection:

@@ -15,6 +15,9 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.base_url, "https://api.deepseek.com")
         self.assertEqual(args.reasoning_effort, "high")
         self.assertTrue(args.thinking)
+        self.assertEqual(args.max_context_tokens, 24_000)
+        self.assertEqual(args.context_summary_tokens, 2_000)
+        self.assertEqual(args.history_search_limit, 5)
 
 
 if __name__ == "__main__":

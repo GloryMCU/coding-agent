@@ -2,7 +2,7 @@
 
 from .agent import Agent, AgentConfig, AgentResult
 from .conversation import ConversationState
-from .context import ContextBuilder
+from .context import ContextBuilder, ContextConfig
 from .model import (
     DeepSeekV4ProClient,
     ModelClient,
@@ -10,8 +10,8 @@ from .model import (
     OpenAIChatClient,
     ToolCall,
 )
-from .tools import ToolRegistry, create_read_only_registry
-from .storage import SqliteConversationStore
+from .tools import ToolRegistry, create_read_only_registry, create_workspace_registry
+from .storage import HistorySearchResult, SqliteConversationStore
 
 __all__ = [
     "Agent",
@@ -19,7 +19,9 @@ __all__ = [
     "AgentResult",
     "ConversationState",
     "ContextBuilder",
+    "ContextConfig",
     "DeepSeekV4ProClient",
+    "HistorySearchResult",
     "ModelClient",
     "ModelResponse",
     "OpenAIChatClient",
@@ -27,4 +29,5 @@ __all__ = [
     "ToolRegistry",
     "SqliteConversationStore",
     "create_read_only_registry",
+    "create_workspace_registry",
 ]

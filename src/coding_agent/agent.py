@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .conversation import ConversationState, Message
-from .context import ContextBuilder
+from .context import ContextBuilder, ContextConfig
 from .errors import (
     LoopDetected,
     MaxStepsExceeded,
@@ -25,6 +25,8 @@ from .tools import ToolRegistry
 DEFAULT_SYSTEM_PROMPT = """You are a coding agent operating on a local workspace.
 Use the available tools when you need evidence from the repository.
 Never invent file contents. Tool errors are observations: correct the arguments or explain the limitation.
+Prefer apply_patch for focused changes and use write_file overwrite only for intentional full replacements.
+Delete files only when the user explicitly requests deletion or it is an unavoidable part of their requested change.
 When the task is complete, respond with a concise final answer and do not call another tool."""
 
 
@@ -35,6 +37,9 @@ class AgentConfig:
     max_model_retries: int = 2
     retry_base_delay_s: float = 0.5
     repeated_tool_call_limit: int = 3
+    max_context_tokens: int = 24_000
+    context_summary_tokens: int = 2_000
+    history_search_limit: int = 5
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:
@@ -45,6 +50,11 @@ class AgentConfig:
             raise ValueError("max_model_retries must be >= 0")
         if self.repeated_tool_call_limit < 1:
             raise ValueError("repeated_tool_call_limit must be >= 1")
+        ContextConfig(
+            max_tokens=self.max_context_tokens,
+            summary_max_tokens=self.context_summary_tokens,
+            history_search_limit=self.history_search_limit,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +85,18 @@ class Agent:
         self._events = events or NullEventSink()
         self._system_prompt = system_prompt
         self._store = store
-        self._context = ContextBuilder(store) if store is not None else None
+        self._context = (
+            ContextBuilder(
+                store,
+                ContextConfig(
+                    max_tokens=self._config.max_context_tokens,
+                    summary_max_tokens=self._config.context_summary_tokens,
+                    history_search_limit=self._config.history_search_limit,
+                ),
+            )
+            if store is not None
+            else None
+        )
         self._workspace = Path(workspace).resolve() if workspace is not None else None
         self._model_name = model_name or type(model).__name__
 

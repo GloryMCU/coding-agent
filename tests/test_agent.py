@@ -11,7 +11,7 @@ from coding_agent.conversation import Message
 from coding_agent.errors import LoopDetected, MaxStepsExceeded, ModelRequestError
 from coding_agent.events import JsonlEventSink
 from coding_agent.model import ModelResponse, ToolCall
-from coding_agent.tools import create_read_only_registry
+from coding_agent.tools import create_read_only_registry, create_workspace_registry
 
 
 class FakeModel:
@@ -72,6 +72,34 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(tool_message["role"], "tool")
         self.assertEqual(tool_message["tool_call_id"], "call-1")
         self.assertIn("A tiny project", tool_message["content"])
+
+    def test_agent_can_create_a_file_with_workspace_tools(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="write-1",
+                            name="write_file",
+                            arguments={"path": "created.py", "content": "value = 42\n"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(text="Created created.py."),
+            ]
+        )
+        agent = Agent(model=model, tools=create_workspace_registry(self.workspace))
+
+        result = agent.run("Create created.py")
+
+        self.assertEqual(result.text, "Created created.py.")
+        self.assertEqual(
+            (self.workspace / "created.py").read_text(encoding="utf-8"),
+            "value = 42\n",
+        )
+        tool_payload = json.loads(model.requests[1][-1]["content"])
+        self.assertTrue(tool_payload["ok"])
+        self.assertTrue(tool_payload["output"]["created"])
 
     def test_model_request_is_retried(self) -> None:
         model = FakeModel(
