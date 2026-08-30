@@ -204,19 +204,49 @@ def create_read_only_registry(
         if end_line is not None and end_line < start_line:
             raise ToolArgumentsError("end_line must be greater than or equal to start_line")
 
+        selected = bytearray()
+        selected_line_count = 0
+        output_truncated = False
+        current_line = 1
         with path.open("rb") as stream:
-            raw = stream.read(max_file_bytes + 1)
-        truncated = len(raw) > max_file_bytes
-        text = raw[:max_file_bytes].decode("utf-8", errors="replace")
+            while True:
+                # A size-limited readline keeps a malicious single-line file from
+                # forcing an unbounded allocation while still allowing the caller
+                # to page to lines located well beyond the output limit.
+                chunk = stream.readline(64 * 1024)
+                if not chunk:
+                    break
+                in_range = current_line >= start_line and (
+                    end_line is None or current_line <= end_line
+                )
+                if in_range:
+                    remaining = max_file_bytes - len(selected)
+                    if remaining <= 0:
+                        output_truncated = True
+                        break
+                    selected.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        output_truncated = True
+                        break
+                    if chunk.endswith(b"\n"):
+                        selected_line_count += 1
+                if chunk.endswith(b"\n"):
+                    if in_range and end_line is not None and current_line >= end_line:
+                        break
+                    current_line += 1
+
+        text = bytes(selected).decode("utf-8", errors="replace")
         lines = text.splitlines()
-        selected = lines[start_line - 1 : end_line]
+        if lines and selected_line_count < len(lines):
+            selected_line_count = len(lines)
 
         return {
             "path": policy.display_path(path),
             "start_line": start_line,
-            "end_line": start_line + max(len(selected) - 1, 0),
-            "content": "\n".join(selected),
-            "truncated": truncated,
+            "end_line": start_line + max(selected_line_count - 1, 0),
+            "content": "\n".join(lines),
+            "bytes_returned": len(selected),
+            "truncated": output_truncated,
         }
 
     registry.register(
@@ -743,6 +773,7 @@ def create_workspace_registry(
     max_write_bytes: int = 1024 * 1024,
     max_command_output_chars: int = 64 * 1024,
     approval_policy: ApprovalPolicy | None = None,
+    command_runner: ControlledCommandRunner | None = None,
 ) -> ToolRegistry:
     """Create the full workspace registry, including bounded mutation tools."""
 
@@ -991,9 +1022,12 @@ def create_workspace_registry(
         )
     )
 
-    command_runner = ControlledCommandRunner(
-        policy.root, max_output_chars=max_command_output_chars
-    )
+    if command_runner is None:
+        command_runner = ControlledCommandRunner(
+            policy.root, max_output_chars=max_command_output_chars
+        )
+    elif command_runner.policy.root != policy.root:
+        raise ValueError("command_runner workspace must match registry workspace")
 
     def command_permission(arguments: dict[str, Any]) -> PermissionRequest:
         argv = command_runner.validate(
@@ -1003,7 +1037,8 @@ def create_workspace_registry(
             tool_name="run_command",
             kind=PermissionKind.EXECUTE,
             description=(
-                f"run argv={argv!r} in cwd={arguments.get('cwd', '.')!r}"
+                f"run argv={argv!r} in cwd={arguments.get('cwd', '.')!r} "
+                f"(os_sandbox={command_runner.sandboxed})"
             ),
         )
 
@@ -1020,7 +1055,9 @@ def create_workspace_registry(
             description=(
                 "Run an approved allowlisted development command with structured "
                 "argv. There is no implicit shell parsing; cwd stays inside the "
-                "workspace and runtime/output are bounded."
+                "workspace and runtime/output are bounded. Commands run in an "
+                "OS-isolated, network-disabled container when the registry is "
+                "configured with a sandboxed command runner."
             ),
             parameters={
                 "type": "object",

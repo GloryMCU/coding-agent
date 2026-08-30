@@ -10,6 +10,8 @@
 可选的 Textual 终端界面提供多轮输入、工具活动、Markdown 回答和审批弹窗，同时
 保留适合脚本与 CI 的一次性文本模式。
 
+安全边界、残余风险和回归要求见 [`SECURITY.md`](SECURITY.md)。
+
 ## 架构
 
 ```text
@@ -34,6 +36,8 @@ ID 不作为本地状态的事实来源。
 为结构化摘要。完整原始消息不会删除，摘要单独保存在 SQLite 的
 `context_summary` 表中，因此可以重新生成。工具调用与对应结果始终作为一个整体
 保留，避免产生孤立的 `tool` 消息。
+压缩记录会被明确标注为低权限、不可信历史数据，不会把仓库或工具输出提升为
+`system` 指令。
 
 SQLite FTS5 会为用户文本、助手文本、推理内容及工具参数/结果建立全文索引，并使用
 trigram 分词支持中文片段及代码标识符子串检索。
@@ -54,6 +58,7 @@ matches = store.search_history(
 
 - Python 3.11+
 - DeepSeek API Key
+- Docker 或 Podman（CLI 默认要求，用于命令的 OS 级隔离）
 
 核心 Agent 代码只使用 Python 标准库。DeepSeek V4 Pro 使用官方文档推荐的
 OpenAI Python 客户端作为 HTTP/API 传输层，不使用任何 Agent SDK：
@@ -72,6 +77,22 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 # 可选：使用代理或兼容网关时覆盖，默认是 https://api.deepseek.com
 $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 ```
+
+CLI 默认以 fail-closed 方式要求本地 OCI 容器运行时和一个明确指定的可信镜像。
+仓库提供仅含 Python 的最小示例；构建不会由 Agent 自动执行，也不会在运行任务时
+自动拉取镜像：
+
+```powershell
+docker build --pull -f sandbox/Dockerfile -t coding-agent-sandbox:python sandbox
+$env:CODING_AGENT_SANDBOX_IMAGE = "coding-agent-sandbox:python"
+
+# 可选；默认自动选择 docker 或 podman
+$env:CODING_AGENT_SANDBOX_RUNTIME = "docker"
+```
+
+示例镜像适合本仓库的标准库测试。Node、Rust、Go、.NET 等项目应从受信任并经过
+审查的基础镜像构建自己的工具链镜像，再通过 `--sandbox-image` 指定。镜像必须已经
+存在于本地；Agent 使用 `--pull=never`，避免执行期间产生隐式网络和供应链变化。
 
 仓库也提供 `.env.example` 作为变量名称示例，但程序不会自动读取 `.env`，避免
 偷偷引入配置框架；请通过进程环境或你自己的密钥管理系统注入密钥。
@@ -106,6 +127,7 @@ coding-agent --max-context-tokens 32000 --context-summary-tokens 3000 `
 coding-agent --history-search-limit 8 --workspace . "回顾之前的数据库决策"
 coding-agent --approval-mode deny --workspace . "只读分析这个仓库"
 coding-agent --approval-mode allow --workspace . "运行测试并修复失败"
+coding-agent --sandbox-image coding-agent-sandbox:python --workspace . "运行测试"
 ```
 
 `--approval-mode` 默认是 `ask`：每次文件写入、补丁、永久删除或命令执行都会在
@@ -187,10 +209,28 @@ python -m coding_agent --workspace . "读取 README.md"
 
 `run_command` 接收字符串数组形式的 `argv`，不把模型输出隐式交给 shell 解析。
 执行程序必须在开发工具白名单中，工作目录必须位于工作区，单次运行默认 120 秒、
-最长 300 秒，stdout/stderr 分别有上限。环境中的 API Key 不会传给子进程。需要
+最长 300 秒，stdout/stderr 分别有上限。子进程使用最小环境白名单，不会继承 API
+Key、Token、密码和任意自定义环境变量；超时会终止为该命令创建的进程组。需要
 PowerShell 时必须显式使用 `powershell` 或 `pwsh`，并且删除、下载、动态执行等
 高风险 cmdlet 会在审批前直接拒绝。通过 `run_command` 调用的 Git 也会拒绝写操作
 和网络操作。
+
+CLI 默认把 `run_command` 与 `verify_project` 放入 Docker/Podman Linux 容器执行：
+
+- 只把工作区绑定到 `/workspace`，不传递宿主 API Key、Token 或任意自定义环境变量；
+- 容器根文件系统只读，工作区保持可写以支持构建和测试；`.git` 额外只读挂载，
+  `.coding-agent` 用不可访问的临时文件系统遮蔽；
+- `--network=none`、`--cap-drop=ALL`、`no-new-privileges`，并限制 PID、内存、CPU、
+  打开文件数、执行时长及输出；
+- 使用非 root 数字用户；超时时按唯一容器名强制删除容器，再终止客户端进程组；
+- 运行时和镜像启动前预检。缺失、守护进程不可用或镜像不在本地时直接退出，绝不
+  静默退回宿主执行。
+
+`--sandbox off` 是面向明确可信环境的高风险逃生开关，会恢复受控但非 OS 隔离的
+宿主进程执行。审批与 OS 隔离是两层独立控制：容器命令仍然遵循 `--approval-mode`。
+Docker Desktop 在 Windows 上通过其 Linux VM 提供上述容器边界；本实现不声称使用
+Windows AppContainer。文件读取和精确修改工具仍在 Agent 进程内执行，依赖路径、
+符号链接、受保护目录和审批策略，不属于容器隔离范围。
 
 `verify_project` 根据仓库标记生成非交互验证计划，并按失败即停执行：
 
@@ -219,7 +259,14 @@ PowerShell 时必须显式使用 `powershell` 或 `pwsh`，并且删除、下载
 `InteractiveApprovalPolicy`、`DenyApprovalPolicy`、`AllowAllApprovalPolicy`。
 不注入策略时保持 Python API 的向后兼容行为；CLI 始终显式注入所选策略。
 
-默认事件日志写入 `.coding-agent/events.jsonl`，该目录不会提交到 Git。
+默认事件日志写入 `.coding-agent/events.jsonl`，该目录不会提交到 Git。JSONL 边界会
+递归脱敏常见凭据字段和文本，并默认移除 `reasoning_content`；实时 TUI 事件不受影响。
+可以离线汇总模型/工具调用、失败、重试、终止原因、耗时和 Token usage：
+
+```powershell
+coding-agent-report .coding-agent/events.jsonl
+```
+
 会话历史默认写入工作区下的 `.coding-agent/history.sqlite3`。数据库把历史拆为
 `session -> message -> part`，工具 part 使用
 `pending -> running -> completed/error` 状态机；进程异常退出后，未完成调用会被
@@ -253,6 +300,7 @@ python -m unittest discover -s tests -v
 - DeepSeek `reasoning_content` 的保留
 - `tool_call_id` 关联
 - 模型请求重试
+- 非正常 `finish_reason` 拒绝、响应 ID/Token usage 记录
 - 最大步数终止
 - 重复工具调用检测
 - 路径穿越和绝对路径拦截
@@ -262,10 +310,13 @@ python -m unittest discover -s tests -v
 - 文件创建、显式覆盖、精确补丁、原子写入和单文件删除保护
 - 读操作免审批、状态变更审批/拒绝，以及拒绝后零副作用
 - 结构化 argv、程序白名单、PowerShell 高危操作拦截和输出捕获
+- 子进程最小环境、超时进程组终止和非沙箱状态标记
+- 审计日志凭据脱敏及 reasoning 移除
 - 仓库验证策略检测与测试执行
 - 工具参数 Schema 校验
 - SQLite 重启后上下文恢复
 - 上下文预算、完整轮次裁剪和结构化摘要持久化
+- 压缩历史不提升为 system 权限
 - FTS5 迁移回填、自动索引同步、会话/序号过滤和相关历史召回
 - 工具调用状态转换、幂等领取和中断恢复
 - plain/interactive CLI 参数兼容
@@ -275,7 +326,10 @@ python -m unittest discover -s tests -v
 
 - CLI 支持使用 `--session-id` 继续历史会话；尚未提供会话列表命令
 - TUI 当前按完整模型响应更新，尚未提供 token/命令输出流式显示和进程取消
-- 命令白名单和审批降低风险，但不是操作系统级容器；不可信仓库仍应在隔离环境运行
+- CLI 命令默认使用 OS 级容器隔离；显式 `--sandbox off` 或直接使用未注入容器后端的
+  Python API 时，结果会返回 `sandboxed=false`，此模式不应用于不可信仓库
+- 容器不是虚拟机安全边界；仍需信任 Docker/Podman、OCI 运行时、内核与指定镜像，
+  高风险场景应使用专用主机或一次性 VM，并优先使用 rootless 运行时
 - 非 Git 目录的 `.gitignore` 回退覆盖常见规则，完整 Git 语义以 Git 工作区为准
 - 上下文 Token 数使用无第三方 tokenizer 的保守估算，不是厂商精确计数
 - 结构化摘要是确定性的历史压缩，尚未使用模型提炼长期语义记忆
@@ -283,6 +337,7 @@ python -m unittest discover -s tests -v
 - trigram 查询至少需要 3 个字符；更短的缩写不适合单独作为检索词
 - DeepSeek V4 Pro 当前通过 OpenAI 兼容的 Chat Completions 格式调用
 
-下一阶段优先增加模型/命令流式事件、取消令牌和会话选择器；之后再增加操作系统级
-进程隔离、可持久化审批规则和更细粒度的网络权限。历史量明显增长且关键词召回不足
+下一阶段优先增加真实任务评测基线、镜像 SBOM/签名校验与更细粒度的只读工作区模式，
+然后增加模型/命令流式事件、取消令牌和会话选择器；之后再增加可持久化审批规则和
+按域名/操作授权的临时网络权限。历史量明显增长且关键词召回不足
 后，再评估向量语义检索与混合排序。

@@ -16,6 +16,7 @@ tui = ["textual>=1.0"]
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"
+coding-agent-report = "coding_agent.quality:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

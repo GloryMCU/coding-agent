@@ -19,6 +19,9 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.context_summary_tokens, 2_000)
         self.assertEqual(args.history_search_limit, 5)
         self.assertEqual(args.approval_mode, "ask")
+        self.assertEqual(args.sandbox, "required")
+        self.assertEqual(args.sandbox_runtime, "auto")
+        self.assertIsNone(args.sandbox_image)
         self.assertFalse(args.interactive)
         self.assertFalse(args.plain)
 
@@ -32,6 +35,23 @@ class CliDefaultsTests(unittest.TestCase):
 
         self.assertTrue(args.interactive)
         self.assertEqual(args.prompt, "Inspect README.md")
+
+    def test_sandbox_configuration_can_be_explicit(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--sandbox",
+                "off",
+                "--sandbox-runtime",
+                "podman",
+                "--sandbox-image",
+                "local/agent:test",
+                "Inspect README.md",
+            ]
+        )
+
+        self.assertEqual(args.sandbox, "off")
+        self.assertEqual(args.sandbox_runtime, "podman")
+        self.assertEqual(args.sandbox_image, "local/agent:test")
 
 
 if __name__ == "__main__":

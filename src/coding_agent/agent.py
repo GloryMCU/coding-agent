@@ -136,7 +136,9 @@ class Agent:
         last_fingerprint: str | None = None
         consecutive_repeats = 0
         for step in range(1, self._config.max_steps + 1):
+            model_started = time.monotonic()
             response = self._request_model(state.messages)
+            model_duration_ms = round((time.monotonic() - model_started) * 1000)
             self._validate_response(response)
             state.add_assistant(response.assistant_message)
             self._events.emit(
@@ -145,6 +147,10 @@ class Agent:
                     "step": step,
                     "assistant_message": response.assistant_message,
                     "text": response.text,
+                    "finish_reason": response.finish_reason,
+                    "usage": response.usage,
+                    "response_id": response.response_id,
+                    "duration_ms": model_duration_ms,
                     "tool_calls": [
                         {"id": call.id, "name": call.name, "arguments": call.arguments}
                         for call in response.tool_calls
@@ -186,7 +192,9 @@ class Agent:
                         f"{self._config.repeated_tool_call_limit} times"
                     )
 
+                tool_started = time.monotonic()
                 result = self._tools.execute(call)
+                tool_duration_ms = round((time.monotonic() - tool_started) * 1000)
                 state.add_tool(result.to_message())
                 self._events.emit(
                     "tool_result",
@@ -197,6 +205,7 @@ class Agent:
                         "ok": result.ok,
                         "output": result.output,
                         "error": result.error,
+                        "duration_ms": tool_duration_ms,
                     },
                 )
 
@@ -248,7 +257,9 @@ class Agent:
             last_fingerprint: str | None = None
             consecutive_repeats = 0
             for step in range(1, self._config.max_steps + 1):
+                model_started = time.monotonic()
                 response = self._request_model(self._context.build(session_id))
+                model_duration_ms = round((time.monotonic() - model_started) * 1000)
                 self._validate_response(response)
                 self._store.append_assistant(session_id, response)
                 self._events.emit(
@@ -258,6 +269,10 @@ class Agent:
                         "step": step,
                         "assistant_message": response.assistant_message,
                         "text": response.text,
+                        "finish_reason": response.finish_reason,
+                        "usage": response.usage,
+                        "response_id": response.response_id,
+                        "duration_ms": model_duration_ms,
                         "tool_calls": [
                             {
                                 "id": call.id,
@@ -313,10 +328,15 @@ class Agent:
 
                     claim = self._store.claim_tool_call(session_id, call.id)
                     if claim.execute:
+                        tool_started = time.monotonic()
                         result = self._tools.execute(claim.call)
+                        tool_duration_ms = round(
+                            (time.monotonic() - tool_started) * 1000
+                        )
                         self._store.finish_tool_call(session_id, result)
                     elif claim.result is not None:
                         result = claim.result
+                        tool_duration_ms = 0
                     else:
                         raise RuntimeError(
                             f"tool call {call.id!r} is already {claim.status}"
@@ -332,6 +352,7 @@ class Agent:
                             "output": result.output,
                             "error": result.error,
                             "replayed": not claim.execute,
+                            "duration_ms": tool_duration_ms,
                         },
                     )
 

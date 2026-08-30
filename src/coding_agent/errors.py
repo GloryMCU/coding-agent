@@ -36,3 +36,7 @@ class WorkspaceAccessError(ToolError):
 class PermissionDenied(ToolError):
     """A local permission policy rejected a tool operation."""
 
+
+class SandboxUnavailableError(ToolError):
+    """A required operating-system isolation backend is unavailable."""
+

@@ -176,7 +176,16 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_jsonl_event_log_records_termination(self) -> None:
         log_path = self.workspace / ".coding-agent" / "events.jsonl"
-        model = FakeModel([ModelResponse.from_parts(text="Done")])
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    text="Done",
+                    finish_reason="stop",
+                    usage={"prompt_tokens": 7, "completion_tokens": 2},
+                    response_id="response-test",
+                )
+            ]
+        )
         agent = Agent(
             model=model,
             tools=create_read_only_registry(self.workspace),
@@ -191,6 +200,31 @@ class AgentLoopTests(unittest.TestCase):
             ["user_message", "model_response", "agent_terminated"],
         )
         self.assertEqual(events[-1]["payload"]["reason"], "final_response")
+        model_event = events[1]["payload"]
+        self.assertEqual(model_event["finish_reason"], "stop")
+        self.assertEqual(model_event["usage"]["prompt_tokens"], 7)
+        self.assertEqual(model_event["response_id"], "response-test")
+        self.assertIsInstance(model_event["duration_ms"], int)
+
+    def test_jsonl_event_log_redacts_credentials_and_reasoning(self) -> None:
+        log_path = self.workspace / ".coding-agent" / "redacted.jsonl"
+        sink = JsonlEventSink(log_path)
+
+        sink.emit(
+            "model_response",
+            {
+                "assistant_message": {
+                    "reasoning_content": "private chain of thought",
+                    "content": "Authorization: Bearer abcdefghijklmnop",
+                },
+                "tool": {"api_key": "sk-abcdefghijklmnop"},
+            },
+        )
+
+        raw = log_path.read_text(encoding="utf-8")
+        self.assertNotIn("private chain of thought", raw)
+        self.assertNotIn("abcdefghijklmnop", raw)
+        self.assertGreaterEqual(raw.count("[REDACTED]"), 3)
 
     def test_composite_event_sink_fans_out_in_order(self) -> None:
         first = RecordingEventSink()

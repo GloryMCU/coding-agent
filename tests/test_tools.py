@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from coding_agent.model import ToolCall
 from coding_agent.permissions import DenyApprovalPolicy, PermissionRequest
@@ -33,6 +35,26 @@ class ReadFileToolTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.output["content"], "two\nthree")
+
+    def test_reads_lines_beyond_the_output_byte_limit(self) -> None:
+        large = self.workspace / "large.txt"
+        large.write_text(
+            "first " + "x" * 80_000 + "\nsecond\ntarget\n",
+            encoding="utf-8",
+        )
+        registry = create_read_only_registry(self.workspace, max_file_bytes=64)
+
+        result = registry.execute(
+            ToolCall(
+                id="call-large",
+                name="read_file",
+                arguments={"path": "large.txt", "start_line": 3, "end_line": 3},
+            )
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.output["content"], "target")
+        self.assertFalse(result.output["truncated"])
 
     def test_rejects_path_traversal(self) -> None:
         result = self.registry.execute(
@@ -505,7 +527,50 @@ class ApprovalAndCommandToolTests(unittest.TestCase):
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.output["exit_code"], 0)
         self.assertEqual(result.output["stdout"], "verified\n")
+        self.assertFalse(result.output["sandboxed"])
         self.assertEqual(policy.requests[0].tool_name, "run_command")
+
+    def test_command_receives_a_minimal_environment_without_secrets(self) -> None:
+        registry = create_workspace_registry(
+            self.workspace, approval_policy=RecordingApprovalPolicy(approved=True)
+        )
+        code = (
+            "import os; "
+            "print(os.getenv('CODING_AGENT_TEST_SECRET', 'missing')); "
+            "print(os.getenv('CI'))"
+        )
+
+        with patch.dict(os.environ, {"CODING_AGENT_TEST_SECRET": "do-not-leak"}):
+            result = registry.execute(
+                ToolCall(
+                    id="environment",
+                    name="run_command",
+                    arguments={"argv": [sys.executable, "-c", code]},
+                )
+            )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["stdout"], "missing\n1\n")
+
+    def test_command_timeout_terminates_the_process_group(self) -> None:
+        registry = create_workspace_registry(
+            self.workspace, approval_policy=RecordingApprovalPolicy(approved=True)
+        )
+
+        result = registry.execute(
+            ToolCall(
+                id="timeout",
+                name="run_command",
+                arguments={
+                    "argv": [sys.executable, "-c", "import time; time.sleep(30)"],
+                    "timeout_s": 1,
+                },
+            )
+        )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.output["timed_out"])
+        self.assertIsNone(result.output["exit_code"])
 
     def test_command_denial_and_powershell_danger_filter(self) -> None:
         denied = create_workspace_registry(

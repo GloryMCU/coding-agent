@@ -62,11 +62,22 @@ class OpenAIMessageParserTests(unittest.TestCase):
             def create(self, **request: object) -> SimpleNamespace:
                 captured_request.update(request)
                 return SimpleNamespace(
-                    choices=[SimpleNamespace(message=SimpleNamespace(
-                        content="Done",
-                        reasoning_content="Reasoned",
-                        tool_calls=None,
-                    ))]
+                    id="response-1",
+                    usage=SimpleNamespace(
+                        prompt_tokens=10,
+                        completion_tokens=5,
+                        total_tokens=15,
+                    ),
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content="Done",
+                                reasoning_content="Reasoned",
+                                tool_calls=None,
+                            ),
+                            finish_reason="stop",
+                        )
+                    ],
                 )
 
         def fake_openai(**kwargs: object) -> SimpleNamespace:
@@ -88,6 +99,61 @@ class OpenAIMessageParserTests(unittest.TestCase):
             {"thinking": {"type": "enabled"}},
         )
         self.assertEqual(response.assistant_message["reasoning_content"], "Reasoned")
+        self.assertEqual(response.finish_reason, "stop")
+        self.assertEqual(response.response_id, "response-1")
+        self.assertEqual(response.usage["total_tokens"], 15)
+
+    def test_client_rejects_truncated_response(self) -> None:
+        class FakeCompletions:
+            def create(self, **request: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content="partial",
+                                reasoning_content=None,
+                                tool_calls=None,
+                            ),
+                            finish_reason="length",
+                        )
+                    ]
+                )
+
+        fake_module = SimpleNamespace(
+            OpenAI=lambda **kwargs: SimpleNamespace(
+                chat=SimpleNamespace(completions=FakeCompletions())
+            )
+        )
+        with patch.dict(sys.modules, {"openai": fake_module}):
+            client = DeepSeekV4ProClient(api_key="test-key")
+            with self.assertRaisesRegex(ModelProtocolError, "did not complete normally"):
+                client.generate([], [], timeout_s=12)
+
+    def test_client_rejects_inconsistent_tool_finish_reason(self) -> None:
+        class FakeCompletions:
+            def create(self, **request: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content="No call",
+                                reasoning_content=None,
+                                tool_calls=None,
+                            ),
+                            finish_reason="tool_calls",
+                        )
+                    ]
+                )
+
+        fake_module = SimpleNamespace(
+            OpenAI=lambda **kwargs: SimpleNamespace(
+                chat=SimpleNamespace(completions=FakeCompletions())
+            )
+        )
+        with patch.dict(sys.modules, {"openai": fake_module}):
+            client = DeepSeekV4ProClient(api_key="test-key")
+            with self.assertRaisesRegex(ModelProtocolError, "without any tool call"):
+                client.generate([], [], timeout_s=12)
 
 
 if __name__ == "__main__":

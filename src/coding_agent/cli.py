@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .agent import Agent, AgentConfig
 from .events import CompositeEventSink, EventSink, JsonlEventSink, NullEventSink
+from .errors import SandboxUnavailableError
+from .execution import ControlledCommandRunner, discover_container_sandbox
 from .model import DeepSeekV4ProClient
 from .permissions import (
     AllowAllApprovalPolicy,
@@ -73,6 +75,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--sandbox",
+        choices=("required", "off"),
+        default="required",
+        help=(
+            "OS isolation for commands: required fails closed unless a verified "
+            "Docker/Podman image is available; off runs on the host (default: required)"
+        ),
+    )
+    parser.add_argument(
+        "--sandbox-runtime",
+        choices=("auto", "docker", "podman"),
+        default=os.getenv("CODING_AGENT_SANDBOX_RUNTIME", "auto"),
+        help="OCI runtime for command isolation (default: auto)",
+    )
+    parser.add_argument(
+        "--sandbox-image",
+        default=os.getenv("CODING_AGENT_SANDBOX_IMAGE"),
+        help=(
+            "Trusted local OCI image used for commands; required unless --sandbox off "
+            "(env: CODING_AGENT_SANDBOX_IMAGE)"
+        ),
+    )
+    parser.add_argument(
         "--max-context-tokens",
         type=int,
         default=24_000,
@@ -128,6 +153,20 @@ def main() -> int:
         raise SystemExit("missing API key: set DEEPSEEK_API_KEY")
 
     workspace = args.workspace.resolve(strict=True)
+    if not workspace.is_dir():
+        raise SystemExit(f"workspace is not a directory: {workspace}")
+    try:
+        sandbox = (
+            discover_container_sandbox(
+                image=args.sandbox_image,
+                runtime=args.sandbox_runtime,
+            )
+            if args.sandbox == "required"
+            else None
+        )
+    except (SandboxUnavailableError, ValueError) as exc:
+        raise SystemExit(f"sandbox unavailable: {exc}") from exc
+    command_runner = ControlledCommandRunner(workspace, sandbox=sandbox)
     database_path = (
         args.db.resolve()
         if args.db is not None
@@ -150,7 +189,9 @@ def main() -> int:
         return Agent(
             model=model,
             tools=create_workspace_registry(
-                workspace, approval_policy=approval_policy
+                workspace,
+                approval_policy=approval_policy,
+                command_runner=command_runner,
             ),
             config=AgentConfig(
                 max_steps=args.max_steps,

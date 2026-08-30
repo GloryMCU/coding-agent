@@ -285,8 +285,8 @@ class SqliteConversationStoreTests(unittest.TestCase):
 
         self.assertLessEqual(estimate_context_tokens(messages), 700)
         self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[1]["role"], "system")
-        self.assertIn("structured record", messages[1]["content"])
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("UNTRUSTED HISTORICAL RECORD", messages[1]["content"])
         self.assertIn("question-4", messages[-2]["content"])
         self.assertIn("answer-4", messages[-1]["content"])
         self.assertNotIn(

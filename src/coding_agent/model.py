@@ -33,6 +33,9 @@ class ModelResponse:
     text: str | None
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
     assistant_message: Message = field(default_factory=dict)
+    finish_reason: str | None = None
+    usage: dict[str, Any] | None = None
+    response_id: str | None = None
 
     @classmethod
     def from_parts(
@@ -41,6 +44,9 @@ class ModelResponse:
         text: str | None = None,
         tool_calls: Sequence[ToolCall] = (),
         reasoning_content: str | None = None,
+        finish_reason: str | None = None,
+        usage: dict[str, Any] | None = None,
+        response_id: str | None = None,
     ) -> "ModelResponse":
         calls = tuple(tool_calls)
         message: Message = {"role": "assistant", "content": text}
@@ -48,7 +54,14 @@ class ModelResponse:
             message["reasoning_content"] = reasoning_content
         if calls:
             message["tool_calls"] = [call.as_openai_dict() for call in calls]
-        return cls(text=text, tool_calls=calls, assistant_message=message)
+        return cls(
+            text=text,
+            tool_calls=calls,
+            assistant_message=message,
+            finish_reason=finish_reason,
+            usage=deepcopy(usage),
+            response_id=response_id,
+        )
 
 
 class ModelClient(Protocol):
@@ -124,7 +137,32 @@ class OpenAIChatClient:
         if not completion.choices:
             raise ModelProtocolError("model response contains no choices")
 
-        return parse_openai_message(completion.choices[0].message)
+        choice = completion.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason in {"length", "content_filter"}:
+            raise ModelProtocolError(
+                f"model response did not complete normally: {finish_reason}"
+            )
+        if finish_reason not in {None, "stop", "tool_calls"}:
+            raise ModelProtocolError(
+                f"unsupported model finish reason: {finish_reason}"
+            )
+
+        response = parse_openai_message(
+            choice.message,
+            finish_reason=finish_reason,
+            usage=_model_dump(getattr(completion, "usage", None)),
+            response_id=getattr(completion, "id", None),
+        )
+        if finish_reason == "tool_calls" and not response.tool_calls:
+            raise ModelProtocolError(
+                "model reported tool_calls completion without any tool call"
+            )
+        if finish_reason == "stop" and response.tool_calls:
+            raise ModelProtocolError(
+                "model reported stop completion while returning tool calls"
+            )
+        return response
 
 
 class DeepSeekV4ProClient(OpenAIChatClient):
@@ -156,7 +194,13 @@ class DeepSeekV4ProClient(OpenAIChatClient):
         )
 
 
-def parse_openai_message(message: Any) -> ModelResponse:
+def parse_openai_message(
+    message: Any,
+    *,
+    finish_reason: str | None = None,
+    usage: dict[str, Any] | None = None,
+    response_id: str | None = None,
+) -> ModelResponse:
     """Parse the SDK response shape without trusting its tool arguments."""
 
     content = getattr(message, "content", None)
@@ -195,4 +239,30 @@ def parse_openai_message(message: Any) -> ModelResponse:
         text=content,
         tool_calls=parsed_calls,
         reasoning_content=reasoning_content,
+        finish_reason=finish_reason,
+        usage=usage,
+        response_id=response_id,
     )
+
+
+def _model_dump(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return deepcopy(value)
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        dumped = dump()
+        return deepcopy(dumped) if isinstance(dumped, dict) else None
+    result = {
+        name: getattr(value, name)
+        for name in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+        )
+        if getattr(value, name, None) is not None
+    }
+    return result or None
