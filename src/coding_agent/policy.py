@@ -8,6 +8,9 @@ from pathlib import Path
 from .errors import WorkspaceAccessError
 
 
+VERIFICATION_CONFIG_NAME = ".coding-agent-verification.toml"
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspacePolicy:
     root: Path
@@ -64,12 +67,14 @@ class WorkspacePolicy:
 
         candidate = parent / requested.name
         relative = candidate.relative_to(self.root)
-        if relative.parts and relative.parts[0].casefold() in {
-            ".git",
-            ".coding-agent",
-        }:
+        protected_root = relative.parts[0].casefold() if relative.parts else ""
+        if protected_root in {".git", ".coding-agent"} or (
+            len(relative.parts) == 1
+            and protected_root == VERIFICATION_CONFIG_NAME.casefold()
+        ):
             raise WorkspaceAccessError(
-                "repository metadata and agent state paths cannot be modified"
+                "repository metadata, agent state, and verification policy paths "
+                "cannot be modified"
             )
         if candidate.is_symlink():
             raise WorkspaceAccessError("symbolic links cannot be modified or deleted")

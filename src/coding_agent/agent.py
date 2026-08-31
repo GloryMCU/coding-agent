@@ -588,14 +588,19 @@ class Agent:
         required = False
         for message in self._store.load_messages(session_id):
             for part in message.parts:
-                if part.type != "tool" or part.status != "completed":
+                if part.type != "tool":
                     continue
                 if part.tool_name == "verify_project":
                     output = part.data.get("output")
-                    if isinstance(output, dict) and output.get("ok") is True:
+                    if (
+                        part.status == "completed"
+                        and isinstance(output, dict)
+                        and output.get("ok") is True
+                    ):
                         required = False
                 elif (
                     part.tool_name is not None
+                    and part.status in {"completed", "running", "interrupted"}
                     and self._tools.requires_verification(part.tool_name)
                 ):
                     required = True

@@ -40,6 +40,41 @@ class FakeModel:
         return self.responses.pop(0)
 
 
+def create_verification_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="change_file",
+            description="Simulate a workspace mutation.",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: {"changed": True},
+            requires_verification=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="verify_project",
+            description="Simulate successful verification.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["test", "build", "format_check", "all"],
+                    }
+                },
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: {"ok": True, "skipped": False},
+        )
+    )
+    return registry
+
+
 class SqliteConversationStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -190,37 +225,7 @@ class SqliteConversationStoreTests(unittest.TestCase):
 
     def test_agent_restores_pending_verification_after_process_restart(self) -> None:
         store, session_id = self.create_store_and_session()
-        registry = ToolRegistry()
-        registry.register(
-            ToolDefinition(
-                name="change_file",
-                description="Simulate a workspace mutation.",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-                handler=lambda arguments: {"changed": True},
-                requires_verification=True,
-            )
-        )
-        registry.register(
-            ToolDefinition(
-                name="verify_project",
-                description="Simulate successful verification.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "kind": {
-                            "type": "string",
-                            "enum": ["test", "build", "format_check", "all"],
-                        }
-                    },
-                    "additionalProperties": False,
-                },
-                handler=lambda arguments: {"ok": True, "skipped": False},
-            )
-        )
+        registry = create_verification_registry()
         store.append_assistant(
             session_id,
             ModelResponse.from_parts(
@@ -260,6 +265,46 @@ class SqliteConversationStoreTests(unittest.TestCase):
         ]
         self.assertEqual(stored_tool_names, ["change_file", "verify_project"])
         self.assertEqual(store.get_session(session_id).status, "completed")
+
+    def test_interrupted_mutation_still_requires_verification_after_restart(self) -> None:
+        store, session_id = self.create_store_and_session()
+        registry = create_verification_registry()
+        store.append_assistant(
+            session_id,
+            ModelResponse.from_parts(
+                tool_calls=[
+                    ToolCall(id="change-crashed", name="change_file", arguments={})
+                ]
+            ),
+        )
+        claim = store.claim_tool_call(session_id, "change-crashed")
+        self.assertTrue(claim.execute)
+        (self.workspace / "changed-before-crash.py").write_text(
+            "changed = True\n", encoding="utf-8"
+        )
+
+        model = FakeModel([ModelResponse.from_parts(text="Verified after crash.")])
+        agent = Agent(
+            model=model,
+            tools=registry,
+            store=SqliteConversationStore(self.database),
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        result = agent.run("Resume after crash", session_id=session_id)
+
+        self.assertEqual(result.text, "Verified after crash.")
+        tool_parts = [
+            part
+            for message in store.load_messages(session_id)
+            for part in message.parts
+            if part.type == "tool"
+        ]
+        self.assertEqual(
+            [(part.tool_name, part.status) for part in tool_parts],
+            [("change_file", "interrupted"), ("verify_project", "completed")],
+        )
 
     def test_all_numbered_schema_migrations_are_applied(self) -> None:
         self.create_store_and_session()

@@ -1,0 +1,6 @@
+version = 1
+
+[[commands]]
+kind = "test"
+argv = ["python", "-m", "unittest", "discover", "-s", "../tests", "-v"]
+cwd = "src"

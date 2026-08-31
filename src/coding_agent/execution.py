@@ -10,13 +10,14 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .errors import SandboxUnavailableError, ToolArgumentsError
-from .policy import WorkspacePolicy
+from .policy import VERIFICATION_CONFIG_NAME, WorkspacePolicy
 
 
 ALLOWED_PROGRAMS = frozenset(
@@ -179,6 +180,31 @@ class ContainerSandbox:
                     (
                         f"type=bind,src={git_source},"
                         f"dst={self.workspace_target}/.git,readonly"
+                    ),
+                ]
+            )
+        verification_config = workspace / VERIFICATION_CONFIG_NAME
+        if verification_config.is_symlink():
+            raise SandboxUnavailableError(
+                "container isolation refuses a symbolic-link verification policy"
+            )
+        if verification_config.exists():
+            if not verification_config.is_file():
+                raise SandboxUnavailableError(
+                    "verification policy must be a regular file"
+                )
+            config_source = verification_config.absolute().as_posix()
+            if "," in config_source:
+                raise SandboxUnavailableError(
+                    "container isolation does not support a verification policy path "
+                    "containing ','"
+                )
+            runtime_argv.extend(
+                [
+                    "--mount",
+                    (
+                        f"type=bind,src={config_source},"
+                        f"dst={self.workspace_target}/{VERIFICATION_CONFIG_NAME},readonly"
                     ),
                 ]
             )
@@ -457,23 +483,42 @@ def discover_verification_plan(workspace: Path, kind: str) -> list[CommandSpec]:
     """Choose non-interactive checks from repository markers."""
 
     requested = {"test", "build", "format_check"} if kind == "all" else {kind}
+    configured = _load_verification_config(workspace)
+    if configured is not None:
+        return [command for command in configured if command.label in requested]
+
     plan: list[CommandSpec] = []
 
     pyproject = workspace / "pyproject.toml"
     if pyproject.exists():
         config = pyproject.read_text(encoding="utf-8", errors="replace")
         if "test" in requested:
+            source_layout = (workspace / "src").is_dir() and (workspace / "tests").is_dir()
+            test_cwd = "src" if source_layout else "."
+            test_path = "../tests" if source_layout else "tests"
             if "[tool.pytest" in config:
-                plan.append(CommandSpec((sys.executable, "-m", "pytest"), label="test"))
+                pytest_argv = [sys.executable, "-m", "pytest"]
+                if (workspace / "tests").is_dir():
+                    pytest_argv.append(test_path)
+                plan.append(
+                    CommandSpec(tuple(pytest_argv), cwd=test_cwd, label="test")
+                )
             elif (workspace / "tests").is_dir():
                 plan.append(
                     CommandSpec(
-                        (sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"),
+                        (
+                            sys.executable,
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            test_path,
+                            "-v",
+                        ),
+                        cwd=test_cwd,
                         label="test",
                     )
                 )
-        if "build" in requested:
-            plan.append(CommandSpec((sys.executable, "-m", "build"), label="build"))
         if "format_check" in requested:
             if "[tool.ruff" in config:
                 plan.append(CommandSpec(("ruff", "format", "--check", "."), label="format_check"))
@@ -516,6 +561,80 @@ def discover_verification_plan(workspace: Path, kind: str) -> list[CommandSpec]:
     return plan
 
 
+def _load_verification_config(workspace: Path) -> list[CommandSpec] | None:
+    """Load a protected, explicit verification plan when the repository provides one."""
+
+    config_path = workspace / VERIFICATION_CONFIG_NAME
+    if not config_path.exists():
+        return None
+    if config_path.is_symlink() or not config_path.is_file():
+        raise ToolArgumentsError(
+            f"{VERIFICATION_CONFIG_NAME} must be a regular file, not a symbolic link"
+        )
+    try:
+        raw = config_path.read_bytes()
+    except OSError as exc:
+        raise ToolArgumentsError(f"could not read {VERIFICATION_CONFIG_NAME}: {exc}") from exc
+    if len(raw) > 64 * 1024:
+        raise ToolArgumentsError(
+            f"{VERIFICATION_CONFIG_NAME} must not exceed 65536 bytes"
+        )
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ToolArgumentsError(
+            f"{VERIFICATION_CONFIG_NAME} is not valid UTF-8 TOML: {exc}"
+        ) from exc
+    unknown_top_level = set(data) - {"version", "commands"}
+    if unknown_top_level:
+        rendered = ", ".join(sorted(unknown_top_level))
+        raise ToolArgumentsError(
+            f"{VERIFICATION_CONFIG_NAME} contains unknown keys: {rendered}"
+        )
+    if type(data.get("version")) is not int or data["version"] != 1:
+        raise ToolArgumentsError(
+            f"{VERIFICATION_CONFIG_NAME} requires integer version = 1"
+        )
+    commands = data.get("commands")
+    if not isinstance(commands, list) or len(commands) > 20:
+        raise ToolArgumentsError(
+            f"{VERIFICATION_CONFIG_NAME} commands must be an array of at most 20 tables"
+        )
+
+    policy = WorkspacePolicy(workspace)
+    validator = ControlledCommandRunner(workspace)
+    plan: list[CommandSpec] = []
+    for index, item in enumerate(commands):
+        location = f"commands[{index}]"
+        if not isinstance(item, dict):
+            raise ToolArgumentsError(f"{location} must be a table")
+        unknown = set(item) - {"kind", "argv", "cwd"}
+        if unknown:
+            rendered = ", ".join(sorted(unknown))
+            raise ToolArgumentsError(f"{location} contains unknown keys: {rendered}")
+        command_kind = item.get("kind")
+        if command_kind not in {"test", "build", "format_check"}:
+            raise ToolArgumentsError(
+                f"{location}.kind must be test, build, or format_check"
+            )
+        argv = item.get("argv")
+        if not isinstance(argv, list) or not all(
+            isinstance(value, str) for value in argv
+        ):
+            raise ToolArgumentsError(f"{location}.argv must be an array of strings")
+        cwd = item.get("cwd", ".")
+        if not isinstance(cwd, str):
+            raise ToolArgumentsError(f"{location}.cwd must be a string")
+        resolved_cwd = policy.resolve_existing_path(cwd)
+        if not resolved_cwd.is_dir():
+            raise ToolArgumentsError(f"{location}.cwd must name a directory")
+        normalized = validator.validate(argv, cwd=cwd)
+        plan.append(
+            CommandSpec(tuple(normalized), cwd=policy.display_path(resolved_cwd) or ".", label=command_kind)
+        )
+    return plan
+
+
 def run_verification_plan(
     runner: ControlledCommandRunner,
     workspace: Path,
@@ -541,6 +660,10 @@ def run_verification_plan(
     return {
         "kind": kind,
         "commands": [list(item.argv) for item in plan],
+        "plan": [
+            {"check": item.label, "argv": list(item.argv), "cwd": item.cwd}
+            for item in plan
+        ],
         "results": results,
         "checks_planned": len(plan),
         "checks_run": len(results),

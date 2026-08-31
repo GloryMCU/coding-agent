@@ -245,10 +245,28 @@ Windows AppContainer。文件读取和精确修改工具仍在 Agent 进程内�
 
 `verify_project` 根据仓库标记生成非交互验证计划，并按失败即停执行：
 
-- Python：unittest/pytest、`python -m build`、配置过的 Ruff/Black check 模式；
+- Python：unittest/pytest，以及配置过的 Ruff/Black check 模式；
 - Node.js：只运行 `package.json` 中存在的 test/build/format-check 脚本；
 - Rust：Cargo test/build 和 `cargo fmt --check`；
 - Go：`go test ./...` 与 `go build ./...`。
+
+仓库可以提供受保护的 `.coding-agent-verification.toml`，用显式命令覆盖自动发现：
+
+```toml
+version = 1
+
+[[commands]]
+kind = "test"
+argv = ["python", "-m", "unittest", "discover", "-s", "../tests", "-v"]
+cwd = "src"
+```
+
+每个 `commands` 项的 `kind` 必须是 `test`、`build` 或 `format_check`，`argv`
+仍受命令白名单约束，`cwd` 必须是工作区内现有目录。配置文件存在时是验证计划的
+唯一来源；未声明的类别会报告为 skipped。核心文件工具禁止模型修改该策略文件，
+容器执行时也会把它单独只读挂载。需要改变策略时应由用户在 Agent 外部审查并修改。
+Python 自动发现不再仅因存在 `pyproject.toml` 就假定已安装 `python -m build`；需要
+构建检查的仓库应在显式配置中声明。
 
 验证类别是 `test`、`build`、`format_check` 或 `all`。格式化只使用检查模式，不会
 自动重写源文件；未检测到相应配置时通过 `skipped_checks` 明确报告，`complete` 也会
@@ -271,7 +289,8 @@ Windows AppContainer。文件读取和精确修改工具仍在 Agent 进程内�
   `expected_sha256`，避免删除内容与预期不符的文件。
 
 创建和修改先在目标目录写入临时文件，再原子发布；单次写入默认限制为 1 MiB。
-`.git` 仓库元数据和 `.coding-agent` 会话状态目录禁止通过变更工具修改。
+`.git` 仓库元数据、`.coding-agent` 会话状态目录和
+`.coding-agent-verification.toml` 验证策略禁止通过变更工具修改。
 `create_read_only_registry` 可供只读嵌入场景使用；CLI 默认使用
 `create_workspace_registry`。嵌入方可以注入自定义 `ApprovalPolicy`，或使用内置的
 `InteractiveApprovalPolicy`、`DenyApprovalPolicy`、`AllowAllApprovalPolicy`。

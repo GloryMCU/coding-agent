@@ -24,6 +24,9 @@ are trusted.
 - Compacted repository and tool data is never inserted with the `system` role.
 - Truncated or content-filtered model responses are not accepted as successful final
   answers.
+- The repository verification policy is protected from file-tool mutation and is
+  mounted read-only into command containers. Interrupted mutation calls conservatively
+  retain the mandatory verification requirement after process recovery.
 
 ## Residual risks
 

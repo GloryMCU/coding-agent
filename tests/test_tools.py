@@ -339,7 +339,11 @@ class WorkspaceMutationToolTests(unittest.TestCase):
                 self.assertIn("escapes the workspace", result.error or "")
 
     def test_protects_repository_metadata_and_agent_state(self) -> None:
-        for protected_path in [".git/config", ".coding-agent/history.sqlite3"]:
+        for protected_path in [
+            ".git/config",
+            ".coding-agent/history.sqlite3",
+            ".coding-agent-verification.toml",
+        ]:
             with self.subTest(path=protected_path):
                 result = self.execute(
                     "write_file",

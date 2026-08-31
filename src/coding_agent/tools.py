@@ -1191,7 +1191,9 @@ def create_workspace_registry(
         plan = discover_verification_plan(
             policy.root, arguments.get("kind", "all")
         )
-        rendered = "; ".join(repr(list(command.argv)) for command in plan)
+        rendered = "; ".join(
+            f"cwd={command.cwd!r} argv={list(command.argv)!r}" for command in plan
+        )
         return PermissionRequest(
             tool_name="verify_project",
             kind=PermissionKind.EXECUTE,

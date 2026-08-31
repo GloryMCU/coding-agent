@@ -7,12 +7,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from coding_agent.errors import SandboxUnavailableError
+from coding_agent.errors import SandboxUnavailableError, ToolArgumentsError
 from coding_agent.execution import (
     ContainerSandbox,
     ControlledCommandRunner,
     discover_container_sandbox,
+    discover_verification_plan,
 )
+from coding_agent.policy import VERIFICATION_CONFIG_NAME
 
 
 class ContainerSandboxTests(unittest.TestCase):
@@ -30,6 +32,9 @@ class ContainerSandboxTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_builds_locked_down_container_invocation(self) -> None:
+        (self.workspace / VERIFICATION_CONFIG_NAME).write_text(
+            "version = 1\ncommands = []\n", encoding="utf-8"
+        )
         argv = self.sandbox.build_argv(
             self.workspace,
             self.workspace / "src",
@@ -57,6 +62,14 @@ class ContainerSandboxTests(unittest.TestCase):
         )
         self.assertTrue(
             any(value.startswith("--tmpfs=/workspace/.coding-agent:") for value in argv)
+        )
+        self.assertTrue(
+            any(
+                value.endswith(
+                    f"dst=/workspace/{VERIFICATION_CONFIG_NAME},readonly"
+                )
+                for value in mounts
+            )
         )
 
     def test_model_arguments_cannot_become_runtime_options(self) -> None:
@@ -139,6 +152,56 @@ class ContainerSandboxTests(unittest.TestCase):
         runner = ControlledCommandRunner(self.workspace, sandbox=self.sandbox)
 
         self.assertTrue(runner.sandboxed)
+
+    def test_explicit_verification_config_is_authoritative(self) -> None:
+        (self.workspace / VERIFICATION_CONFIG_NAME).write_text(
+            """version = 1
+
+[[commands]]
+kind = "test"
+argv = ["python", "-m", "unittest", "discover", "-s", "../tests", "-v"]
+cwd = "src"
+""",
+            encoding="utf-8",
+        )
+        (self.workspace / "pyproject.toml").write_text(
+            "[build-system]\nrequires = []\n",
+            encoding="utf-8",
+        )
+
+        plan = discover_verification_plan(self.workspace, "all")
+
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0].label, "test")
+        self.assertEqual(plan[0].cwd, "src")
+        self.assertEqual(plan[0].argv[0], "python")
+
+    def test_default_python_plan_uses_src_layout_without_implicit_build(self) -> None:
+        (self.workspace / "tests").mkdir()
+        (self.workspace / "pyproject.toml").write_text(
+            "[build-system]\nrequires = []\n",
+            encoding="utf-8",
+        )
+
+        plan = discover_verification_plan(self.workspace, "all")
+
+        self.assertEqual([command.label for command in plan], ["test"])
+        self.assertEqual(plan[0].cwd, "src")
+        self.assertIn("../tests", plan[0].argv)
+
+    def test_invalid_verification_config_is_rejected(self) -> None:
+        (self.workspace / VERIFICATION_CONFIG_NAME).write_text(
+            """version = 1
+
+[[commands]]
+kind = "test"
+argv = ["sh", "-c", "exit 0"]
+""",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ToolArgumentsError, "not allowlisted"):
+            discover_verification_plan(self.workspace, "all")
 
 
 if __name__ == "__main__":
