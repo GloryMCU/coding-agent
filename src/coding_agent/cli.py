@@ -20,6 +20,7 @@ from .permissions import (
 )
 from .storage import SqliteConversationStore
 from .tools import create_workspace_registry
+from .web_tools import WebAccessClient
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +67,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument(
+        "--model-timeout-s",
+        type=float,
+        default=60.0,
+        help="Timeout for each model request in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--max-model-retries",
+        type=int,
+        default=2,
+        help="Retries after a model transport failure (default: 2)",
+    )
+    parser.add_argument(
+        "--retry-base-delay-s",
+        type=float,
+        default=0.5,
+        help="Initial exponential retry delay in seconds (default: 0.5)",
+    )
+    parser.add_argument(
         "--approval-mode",
         choices=("ask", "deny", "allow"),
         default="ask",
@@ -98,16 +117,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--web-access",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Expose restricted web_search/fetch_webpage tools to the agent "
+            "(default: enabled; search requires BRAVE_SEARCH_API_KEY)"
+        ),
+    )
+    parser.add_argument(
         "--max-context-tokens",
         type=int,
-        default=24_000,
-        help="Approximate model context budget for durable sessions (default: 24000)",
+        default=131_072,
+        help="Approximate model context budget for durable sessions (default: 131072)",
     )
     parser.add_argument(
         "--context-summary-tokens",
         type=int,
-        default=2_000,
-        help="Maximum share of context used by compacted history (default: 2000)",
+        default=8_192,
+        help="Maximum share of context used by compacted history (default: 8192)",
     )
     parser.add_argument(
         "--history-search-limit",
@@ -167,6 +195,11 @@ def main() -> int:
     except (SandboxUnavailableError, ValueError) as exc:
         raise SystemExit(f"sandbox unavailable: {exc}") from exc
     command_runner = ControlledCommandRunner(workspace, sandbox=sandbox)
+    web_client = (
+        WebAccessClient(brave_api_key=os.getenv("BRAVE_SEARCH_API_KEY"))
+        if args.web_access
+        else None
+    )
     database_path = (
         args.db.resolve()
         if args.db is not None
@@ -192,9 +225,13 @@ def main() -> int:
                 workspace,
                 approval_policy=approval_policy,
                 command_runner=command_runner,
+                web_client=web_client,
             ),
             config=AgentConfig(
                 max_steps=args.max_steps,
+                model_timeout_s=args.model_timeout_s,
+                max_model_retries=args.max_model_retries,
+                retry_base_delay_s=args.retry_base_delay_s,
                 max_context_tokens=args.max_context_tokens,
                 context_summary_tokens=args.context_summary_tokens,
                 history_search_limit=args.history_search_limit,

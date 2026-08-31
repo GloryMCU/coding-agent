@@ -122,13 +122,24 @@ coding-agent --plain --workspace . "只输出项目摘要"
 ```powershell
 coding-agent --reasoning-effort max --workspace . "分析项目架构"
 coding-agent --no-thinking --workspace . "读取 README.md"
-coding-agent --max-context-tokens 32000 --context-summary-tokens 3000 `
+coding-agent --max-context-tokens 262144 --context-summary-tokens 16384 `
   --workspace . "继续长会话"
 coding-agent --history-search-limit 8 --workspace . "回顾之前的数据库决策"
 coding-agent --approval-mode deny --workspace . "只读分析这个仓库"
 coding-agent --approval-mode allow --workspace . "运行测试并修复失败"
 coding-agent --sandbox-image coding-agent-sandbox:python --workspace . "运行测试"
+coding-agent --model-timeout-s 180 --max-model-retries 5 `
+  --retry-base-delay-s 1 --workspace . "继续长任务"
 ```
+
+持久会话默认使用约 128K（131072）Token 的上下文预算，其中最多约 8K（8192）
+用于压缩后的历史摘要。Token 数是本地保守估算值；可以通过上述参数为特别长的任务
+临时调整。
+
+模型连接中断、响应体读取失败或请求超时时，Agent 会在同一模型步骤内按指数退避重试，
+不会重复已经完成的本地工具调用。上述三个参数可用于高延迟模型或不稳定的兼容网关；
+持续出现 `stream disconnected before completion` 时还应检查代理/VPN、网关健康状态和
+`--base-url` 是否指向预期端点。
 
 `--approval-mode` 默认是 `ask`：每次文件写入、补丁、永久删除或命令执行都会在
 终端显示具体操作，并只允许单次确认；交互界面使用不会阻塞页面的审批弹窗。`deny`
@@ -242,6 +253,13 @@ Windows AppContainer。文件读取和精确修改工具仍在 Agent 进程内�
 验证类别是 `test`、`build`、`format_check` 或 `all`。格式化只使用检查模式，不会
 自动重写源文件；未检测到相应配置时通过 `skipped_checks` 明确报告，`complete` 也会
 保持为 false。每次验证计划作为一个完整操作请求用户审批。
+
+成功执行 `write_file`、`apply_patch`、`delete_file` 或可能改变工作区的
+`run_command` 后，Agent 核心会设置强制验证状态。模型给出最终回答时，核心先自动
+执行一次 `verify_project(kind="all")`：通过后才接受并保存最终回答；检查失败会把
+结果写回对话供模型继续修复；没有可用检查、验证权限被拒绝或验证工具不可用时，
+核心抛出 `VerificationRequiredError`，不会把未验证回答当作完成。该状态可从 SQLite
+工具历史恢复，因此重启进程或继续持久会话也不能绕过验证门。
 
 文件变更工具遵循以下约束：
 

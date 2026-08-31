@@ -26,8 +26,8 @@ SUMMARY_PREFIX = (
 
 @dataclass(frozen=True, slots=True)
 class ContextConfig:
-    max_tokens: int = 24_000
-    summary_max_tokens: int = 2_000
+    max_tokens: int = 131_072
+    summary_max_tokens: int = 8_192
     history_search_limit: int = 5
 
     def __post_init__(self) -> None:

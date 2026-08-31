@@ -124,6 +124,85 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Inspect the project", rendered)
             self.assertIn("Finished", rendered)
 
+    async def test_enter_submits_and_shift_enter_inserts_a_newline(self) -> None:
+        app = self.make_app()
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            prompt = app._prompt()
+            prompt.focus()
+            prompt.text = "First line"
+            prompt.move_cursor((0, len(prompt.text)))
+            await pilot.press("shift+enter")
+            self.assertEqual(prompt.text, "First line\n")
+
+            prompt.insert("Second line")
+            await pilot.press("enter")
+            for _ in range(100):
+                await pilot.pause(0.01)
+                if not app.busy:
+                    break
+
+            self.assertEqual(self.stub.prompts, ["First line\nSecond line"])
+
+    async def test_tool_details_are_replaced_by_status_and_not_logged(self) -> None:
+        app = self.make_app()
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.post_agent_event(
+                "model_response",
+                {
+                    "tool_calls": [
+                        {
+                            "name": "read_file",
+                            "arguments": {"path": "private-details.py"},
+                        }
+                    ]
+                },
+            )
+            activity = str(app.query_one("#activity", Static).render())
+            self.assertIn("Reading file", activity)
+
+            app.post_agent_event(
+                "tool_result",
+                {
+                    "name": "read_file",
+                    "ok": True,
+                    "output": {"path": "private-details.py", "content": "hidden"},
+                },
+            )
+            app.post_agent_event(
+                "model_response",
+                {"tool_calls": [], "text": "Final answer only"},
+            )
+
+            rendered = "\n".join(
+                line.text for line in app.query_one("#conversation", RichLog).lines
+            )
+            self.assertIn("Final answer only", rendered)
+            self.assertNotIn("read_file", rendered)
+            self.assertNotIn("private-details.py", rendered)
+            self.assertNotIn("hidden", rendered)
+
+    async def test_provisional_final_is_hidden_while_verification_runs(self) -> None:
+        app = self.make_app()
+
+        async with app.run_test(size=(100, 32)):
+            app.post_agent_event(
+                "model_response",
+                {
+                    "tool_calls": [],
+                    "text": "Unverified final answer",
+                    "provisional": True,
+                },
+            )
+
+            rendered = "\n".join(
+                line.text for line in app.query_one("#conversation", RichLog).lines
+            )
+            activity = str(app.query_one("#activity", Static).render())
+            self.assertNotIn("Unverified final answer", rendered)
+            self.assertIn("Verifying project", activity)
+
     async def test_approval_modal_resolves_future(self) -> None:
         app = self.make_app()
         request = PermissionRequest(

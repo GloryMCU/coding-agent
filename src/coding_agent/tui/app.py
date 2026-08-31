@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable, TypeAlias
@@ -12,6 +11,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Vertical
 from textual.widgets import Footer, Header, RichLog, Static, TextArea
 from textual.worker import Worker
 
@@ -30,6 +30,23 @@ from .screens import ApprovalScreen
 AgentFactory: TypeAlias = Callable[[EventSink, ApprovalPolicy], Agent]
 
 
+class PromptTextArea(TextArea):
+    """Composer that sends on Enter while retaining Shift+Enter for new lines."""
+
+    BINDINGS = [
+        Binding("enter", "submit", "Send", show=False, priority=True),
+        Binding("shift+enter", "insert_newline", "New line", show=False),
+    ]
+
+    def action_submit(self) -> None:
+        if not self.disabled:
+            self.app.action_submit_prompt()
+
+    def action_insert_newline(self) -> None:
+        start, end = self.selection
+        self.replace("\n", start, end, maintain_selection_offset=False)
+
+
 class CodingAgentApp(App[None]):
     """A deliberately small TUI shell around the existing agent core."""
 
@@ -38,7 +55,6 @@ class CodingAgentApp(App[None]):
 
     BINDINGS = [
         Binding("ctrl+enter", "submit_prompt", "Send", priority=True),
-        Binding("ctrl+s", "submit_prompt", "Send", priority=True),
         Binding("ctrl+l", "clear_conversation", "Clear", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
@@ -51,33 +67,44 @@ class CodingAgentApp(App[None]):
 
     Header {
         height: 1;
+        background: $panel;
     }
 
     #context-bar {
-        height: 3;
-        padding: 0 2;
+        height: 2;
+        padding: 0 3;
         color: $text-muted;
-        border-bottom: solid $primary-background;
+        background: $panel;
+        border-bottom: solid $primary-background-lighten-1;
         content-align: left middle;
     }
 
     #conversation {
         height: 1fr;
-        padding: 1 2;
+        padding: 1 3 2 3;
         scrollbar-size: 1 1;
+        background: $background;
+    }
+
+    #composer {
+        height: auto;
+        min-height: 7;
+        padding: 0 2 1 2;
+        background: $panel;
+        border-top: solid $primary-background-lighten-1;
     }
 
     #activity {
-        height: 3;
-        padding: 0 2;
+        height: 2;
+        padding: 0 1;
         color: $text-muted;
-        border-top: solid $primary-background;
         content-align: left middle;
     }
 
     #prompt {
-        height: 6;
-        margin: 0 1 1 1;
+        height: 4;
+        margin: 0;
+        padding: 0 1;
         border: round $primary;
         background: $surface;
     }
@@ -88,6 +115,7 @@ class CodingAgentApp(App[None]):
 
     Footer {
         height: 1;
+        background: $panel;
     }
     """
 
@@ -114,6 +142,7 @@ class CodingAgentApp(App[None]):
         self.agent_worker: Worker[AgentResult] | None = None
         self.tui_approval: TuiApprovalPolicy | None = None
         self.busy = False
+        self.completed_tools = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -125,13 +154,16 @@ class CodingAgentApp(App[None]):
             markup=False,
             auto_scroll=True,
         )
-        yield Static("Idle", id="activity")
-        yield TextArea(
-            "",
-            id="prompt",
-            show_line_numbers=False,
-            soft_wrap=True,
-        )
+        with Vertical(id="composer"):
+            yield Static("Ready  ·  Enter send  ·  Shift+Enter new line", id="activity")
+            yield PromptTextArea(
+                "",
+                id="prompt",
+                show_line_numbers=False,
+                soft_wrap=True,
+                highlight_cursor_line=False,
+                placeholder="Ask coding-agent to inspect, change, or explain…",
+            )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -148,8 +180,8 @@ class CodingAgentApp(App[None]):
         self._refresh_context()
         self._conversation().write(
             Text.from_markup(
-                "[bold cyan]coding-agent[/] is ready. "
-                "Type a task, or [bold]/help[/] for local commands."
+                "[bold cyan]coding-agent[/] is ready  ·  "
+                "[dim]Type [bold]/help[/] for local commands.[/]"
             )
         )
         self._prompt().focus()
@@ -178,6 +210,7 @@ class CodingAgentApp(App[None]):
             return
 
         self._prompt().text = ""
+        self.completed_tools = 0
         self._set_busy(True, "Thinking…")
         self.agent_worker = self.run_agent(prompt)
 
@@ -205,66 +238,45 @@ class CodingAgentApp(App[None]):
             return
 
         if event_type == "model_response":
-            assistant_message = payload.get("assistant_message") or {}
-            reasoning = assistant_message.get("reasoning_content")
-            if reasoning:
-                excerpt = _one_line(str(reasoning), limit=240)
-                self._conversation().write(
-                    Text.assemble(("  reasoning  ", "dim magenta"), (excerpt, "dim"))
-                )
-            for call in payload.get("tool_calls", []):
-                name = str(call.get("name", "tool"))
-                arguments = _compact_json(call.get("arguments", {}), limit=260)
-                self._conversation().write(
-                    Text.assemble(
-                        ("○ ", "yellow"),
-                        (name, "bold yellow"),
-                        (f"  {arguments}", "dim"),
-                    )
-                )
-                self._set_activity(f"Running tool · {name}")
+            if payload.get("provisional"):
+                self._set_activity("Verifying project…")
+                return
+            tool_calls = payload.get("tool_calls", [])
+            if tool_calls:
+                names = [str(call.get("name", "tool")) for call in tool_calls]
+                self._set_activity(_tool_activity(names, self.completed_tools))
+                return
             text = payload.get("text")
             if text:
-                self._conversation().write(Text("Agent", style="bold green"))
+                self._conversation().write(
+                    Text.assemble(("◆ ", "bold green"), ("Agent", "bold green"))
+                )
                 self._conversation().write(Markdown(str(text)))
+                self._set_activity("Finishing…")
             return
 
         if event_type == "tool_result":
             ok = bool(payload.get("ok"))
-            marker = "✓" if ok else "✗"
-            style = "green" if ok else "red"
             name = str(payload.get("name", "tool"))
-            detail = (
-                _summarize_output(payload.get("output"))
-                if ok
-                else _one_line(str(payload.get("error", "failed")), limit=300)
-            )
-            self._conversation().write(
-                Text.assemble(
-                    (f"{marker} ", style),
-                    (name, f"bold {style}"),
-                    (f"  {detail}" if detail else "", "dim"),
+            self.completed_tools += 1
+            if ok:
+                self._set_activity(
+                    f"Working…  ·  {self.completed_tools} tool"
+                    f"{'s' if self.completed_tools != 1 else ''} completed"
                 )
-            )
-            self._set_activity("Thinking…")
+            else:
+                self._set_activity(f"Tool failed · {_friendly_tool_name(name)}")
             return
 
         if event_type == "model_request_error":
-            self._conversation().write(
-                Text(
-                    f"Model request failed; retry {payload.get('attempt')}: "
-                    f"{payload.get('error')}",
-                    style="red",
-                )
+            self._set_activity(
+                f"Model request failed · retry {payload.get('attempt', '?')}…"
             )
             return
 
         if event_type == "tool_calls_recovered":
-            self._conversation().write(
-                Text(
-                    f"Recovered {payload.get('count', 0)} interrupted tool call(s).",
-                    style="yellow",
-                )
+            self._set_activity(
+                f"Recovered {payload.get('count', 0)} interrupted tool call(s)"
             )
             return
 
@@ -284,14 +296,10 @@ class CodingAgentApp(App[None]):
             decision = bool(approved)
             if not future.done():
                 future.set_result(decision)
-            self._conversation().write(
-                Text(
-                    f"{'✓ Allowed' if decision else '✗ Denied'} · "
-                    f"{request.tool_name}",
-                    style="green" if decision else "red",
-                )
+            self._set_activity(
+                f"{'Allowed' if decision else 'Denied'} · "
+                f"{_friendly_tool_name(request.tool_name)}"
             )
-            self._set_activity("Thinking…")
 
         self.push_screen(ApprovalScreen(request), resolved)
 
@@ -318,7 +326,7 @@ class CodingAgentApp(App[None]):
                 Text.from_markup(
                     "[bold]/new[/] new session  ·  [bold]/clear[/] clear view  ·  "
                     "[bold]/exit[/] quit\n"
-                    "[dim]Ctrl+Enter or Ctrl+S sends the prompt.[/]"
+                    "[dim]Enter sends · Shift+Enter adds a new line.[/]"
                 )
             )
             return True
@@ -342,7 +350,12 @@ class CodingAgentApp(App[None]):
         self.busy = busy
         if self.is_mounted:
             self._prompt().disabled = busy
-            self._set_activity(activity)
+            if busy:
+                self._set_activity(activity)
+            else:
+                self._set_activity(
+                    f"{activity}  ·  Enter send  ·  Shift+Enter new line"
+                )
 
     def _set_activity(self, activity: str) -> None:
         self.query_one("#activity", Static).update(activity)
@@ -350,52 +363,48 @@ class CodingAgentApp(App[None]):
     def _refresh_context(self) -> None:
         session = self.session_id[:8] if self.session_id else "new"
         self.query_one("#context-bar", Static).update(
-            f"Workspace  {self.workspace}\n"
-            f"Model  {self.model_name}   ·   Approval  {self.approval_mode}   ·   "
-            f"Session  {session}"
+            f"{self.workspace}   ·   {self.model_name}   ·   "
+            f"approval {self.approval_mode}   ·   session {session}"
         )
 
     def _write_message(self, role: str, content: str, color: str) -> None:
-        self._conversation().write(Text(role, style=f"bold {color}"))
+        marker = "›" if role == "You" else "◆"
+        self._conversation().write(
+            Text.assemble((f"{marker} ", f"bold {color}"), (role, f"bold {color}"))
+        )
         self._conversation().write(Text(content))
 
     def _conversation(self) -> RichLog:
         return self.query_one("#conversation", RichLog)
 
-    def _prompt(self) -> TextArea:
-        return self.query_one("#prompt", TextArea)
+    def _prompt(self) -> PromptTextArea:
+        return self.query_one("#prompt", PromptTextArea)
 
 
-def _compact_json(value: Any, *, limit: int) -> str:
-    try:
-        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    except (TypeError, ValueError):
-        rendered = repr(value)
-    return _one_line(rendered, limit=limit)
+def _friendly_tool_name(name: str) -> str:
+    labels = {
+        "read_file": "Reading file",
+        "list_files": "Listing files",
+        "glob_files": "Finding files",
+        "search_text": "Searching code",
+        "web_search": "Searching the web",
+        "fetch_webpage": "Reading web page",
+        "git_status": "Checking Git status",
+        "git_diff": "Reviewing changes",
+        "git_log": "Reading Git history",
+        "write_file": "Writing file",
+        "apply_patch": "Applying patch",
+        "delete_file": "Deleting file",
+        "run_command": "Running command",
+        "verify_project": "Verifying project",
+    }
+    return labels.get(name, name.replace("_", " ").strip().capitalize() or "Using tool")
 
 
-def _one_line(value: str, *, limit: int) -> str:
-    compact = " ".join(value.split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: max(0, limit - 1)] + "…"
-
-
-def _summarize_output(output: Any) -> str:
-    if not isinstance(output, dict):
-        return _one_line(str(output or ""), limit=300)
-    preferred = (
-        "path",
-        "count",
-        "match_count",
-        "exit_code",
-        "duration_ms",
-        "created",
-        "overwritten",
-        "deleted",
-        "replacements",
-    )
-    summary = {key: output[key] for key in preferred if key in output}
-    if not summary:
-        summary = {key: output[key] for key in tuple(output)[:3]}
-    return _compact_json(summary, limit=300)
+def _tool_activity(names: list[str], completed: int) -> str:
+    if len(names) == 1:
+        current = _friendly_tool_name(names[0])
+    else:
+        current = f"Using {len(names)} tools"
+    prefix = f"{completed} completed  ·  " if completed else ""
+    return f"Working…  ·  {prefix}{current}"

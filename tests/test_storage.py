@@ -16,7 +16,12 @@ from coding_agent.context import (
 from coding_agent.conversation import Message
 from coding_agent.model import ModelResponse, ToolCall
 from coding_agent.storage import SqliteConversationStore
-from coding_agent.tools import ToolExecutionResult, create_read_only_registry
+from coding_agent.tools import (
+    ToolDefinition,
+    ToolExecutionResult,
+    ToolRegistry,
+    create_read_only_registry,
+)
 
 
 class FakeModel:
@@ -182,6 +187,79 @@ class SqliteConversationStoreTests(unittest.TestCase):
             ["system", "user", "assistant", "user"],
         )
         self.assertEqual(request[-2]["content"], "First answer")
+
+    def test_agent_restores_pending_verification_after_process_restart(self) -> None:
+        store, session_id = self.create_store_and_session()
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="change_file",
+                description="Simulate a workspace mutation.",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=lambda arguments: {"changed": True},
+                requires_verification=True,
+            )
+        )
+        registry.register(
+            ToolDefinition(
+                name="verify_project",
+                description="Simulate successful verification.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["test", "build", "format_check", "all"],
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+                handler=lambda arguments: {"ok": True, "skipped": False},
+            )
+        )
+        store.append_assistant(
+            session_id,
+            ModelResponse.from_parts(
+                tool_calls=[
+                    ToolCall(id="change-1", name="change_file", arguments={})
+                ]
+            ),
+        )
+        claim = store.claim_tool_call(session_id, "change-1")
+        self.assertTrue(claim.execute)
+        store.finish_tool_call(
+            session_id,
+            ToolExecutionResult(
+                tool_call_id="change-1",
+                name="change_file",
+                ok=True,
+                output={"changed": True},
+            ),
+        )
+        model = FakeModel([ModelResponse.from_parts(text="Verified after restart.")])
+        agent = Agent(
+            model=model,
+            tools=registry,
+            store=SqliteConversationStore(self.database),
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        result = agent.run("Continue", session_id=session_id)
+
+        self.assertEqual(result.text, "Verified after restart.")
+        stored_tool_names = [
+            part.tool_name
+            for message in store.load_messages(session_id)
+            for part in message.parts
+            if part.type == "tool"
+        ]
+        self.assertEqual(stored_tool_names, ["change_file", "verify_project"])
+        self.assertEqual(store.get_session(session_id).status, "completed")
 
     def test_all_numbered_schema_migrations_are_applied(self) -> None:
         self.create_store_and_session()

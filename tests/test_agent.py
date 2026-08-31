@@ -8,10 +8,21 @@ from typing import Any
 
 from coding_agent.agent import Agent, AgentConfig
 from coding_agent.conversation import Message
-from coding_agent.errors import LoopDetected, MaxStepsExceeded, ModelRequestError
+from coding_agent.errors import (
+    LoopDetected,
+    MaxStepsExceeded,
+    ModelRequestError,
+    VerificationRequiredError,
+)
+from coding_agent.execution import ControlledCommandRunner
 from coding_agent.events import CompositeEventSink, JsonlEventSink
 from coding_agent.model import ModelResponse, ToolCall
-from coding_agent.tools import create_read_only_registry, create_workspace_registry
+from coding_agent.tools import (
+    ToolDefinition,
+    ToolRegistry,
+    create_read_only_registry,
+    create_workspace_registry,
+)
 
 
 class FakeModel:
@@ -39,6 +50,67 @@ class RecordingEventSink:
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> None:
         self.events.append((event_type, payload))
+
+
+class PassingCommandRunner(ControlledCommandRunner):
+    def run(
+        self,
+        argv: list[str] | tuple[str, ...],
+        *,
+        cwd: str = ".",
+        timeout_s: int = 120,
+    ) -> dict[str, Any]:
+        return {
+            "argv": list(argv),
+            "cwd": cwd,
+            "exit_code": 0,
+            "timed_out": False,
+            "duration_ms": 0,
+            "stdout": "",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "sandboxed": False,
+        }
+
+
+def create_verification_registry(
+    verification_outputs: list[dict[str, Any]],
+) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="change_file",
+            description="Simulate a successful workspace mutation.",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: {"changed": True},
+            requires_verification=True,
+        )
+    )
+
+    outputs = iter(verification_outputs)
+    registry.register(
+        ToolDefinition(
+            name="verify_project",
+            description="Return the next deterministic verification result.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["test", "build", "format_check", "all"],
+                    }
+                },
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: next(outputs),
+        )
+    )
+    return registry
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -82,6 +154,18 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("A tiny project", tool_message["content"])
 
     def test_agent_can_create_a_file_with_workspace_tools(self) -> None:
+        (self.workspace / "pyproject.toml").write_text(
+            "[build-system]\nrequires = []\nbuild-backend = 'setuptools.build_meta'\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "tests").mkdir()
+        (self.workspace / "tests" / "test_sample.py").write_text(
+            "import unittest\n\n"
+            "class Sample(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
         model = FakeModel(
             [
                 ModelResponse.from_parts(
@@ -96,7 +180,13 @@ class AgentLoopTests(unittest.TestCase):
                 ModelResponse.from_parts(text="Created created.py."),
             ]
         )
-        agent = Agent(model=model, tools=create_workspace_registry(self.workspace))
+        agent = Agent(
+            model=model,
+            tools=create_workspace_registry(
+                self.workspace,
+                command_runner=PassingCommandRunner(self.workspace),
+            ),
+        )
 
         result = agent.run("Create created.py")
 
@@ -108,6 +198,125 @@ class AgentLoopTests(unittest.TestCase):
         tool_payload = json.loads(model.requests[1][-1]["content"])
         self.assertTrue(tool_payload["ok"])
         self.assertTrue(tool_payload["output"]["created"])
+
+    def test_final_response_is_blocked_until_automatic_verification_passes(
+        self,
+    ) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(text="Changes are complete."),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry(
+                [{"ok": True, "skipped": False, "results": []}]
+            ),
+            events=events,
+        )
+
+        result = agent.run("Change the project")
+
+        self.assertEqual(result.text, "Changes are complete.")
+        self.assertEqual(
+            [message["role"] for message in result.conversation.messages],
+            ["system", "user", "assistant", "tool", "assistant", "tool", "assistant"],
+        )
+        verification_call = result.conversation.messages[-3]
+        self.assertEqual(
+            verification_call["tool_calls"][0]["function"]["name"],
+            "verify_project",
+        )
+        automatic_results = [
+            payload
+            for event_type, payload in events.events
+            if event_type == "tool_result" and payload.get("automatic")
+        ]
+        self.assertEqual(len(automatic_results), 1)
+
+    def test_failed_verification_is_returned_to_model_before_retrying_final(
+        self,
+    ) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(text="Premature final answer."),
+                ModelResponse.from_parts(text="Verified final answer."),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry(
+                [
+                    {"ok": False, "skipped": False, "results": [{"exit_code": 1}]},
+                    {"ok": True, "skipped": False, "results": [{"exit_code": 0}]},
+                ]
+            ),
+            events=events,
+        )
+
+        result = agent.run("Change and fix the project")
+
+        self.assertEqual(result.text, "Verified final answer.")
+        self.assertEqual(result.steps, 3)
+        failed_result = json.loads(model.requests[2][-1]["content"])
+        self.assertFalse(failed_result["output"]["ok"])
+        assistant_texts = [
+            message.get("content")
+            for message in result.conversation.messages
+            if message["role"] == "assistant"
+        ]
+        self.assertNotIn("Premature final answer.", assistant_texts)
+        self.assertTrue(
+            any(
+                event_type == "verification_gate_blocked"
+                and payload["reason"] == "tests_failed"
+                for event_type, payload in events.events
+            )
+        )
+
+    def test_verification_unavailable_raises_instead_of_accepting_final(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="change_file",
+                description="Simulate a mutation.",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=lambda arguments: {"changed": True},
+                requires_verification=True,
+            )
+        )
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(text="Must not be accepted."),
+            ]
+        )
+        agent = Agent(model=model, tools=registry)
+
+        with self.assertRaisesRegex(
+            VerificationRequiredError, "unknown tool: verify_project"
+        ):
+            agent.run("Change the project")
 
     def test_model_request_is_retried(self) -> None:
         model = FakeModel(

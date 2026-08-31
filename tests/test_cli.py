@@ -15,13 +15,17 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.base_url, "https://api.deepseek.com")
         self.assertEqual(args.reasoning_effort, "high")
         self.assertTrue(args.thinking)
-        self.assertEqual(args.max_context_tokens, 24_000)
-        self.assertEqual(args.context_summary_tokens, 2_000)
+        self.assertEqual(args.model_timeout_s, 60.0)
+        self.assertEqual(args.max_model_retries, 2)
+        self.assertEqual(args.retry_base_delay_s, 0.5)
+        self.assertEqual(args.max_context_tokens, 131_072)
+        self.assertEqual(args.context_summary_tokens, 8_192)
         self.assertEqual(args.history_search_limit, 5)
         self.assertEqual(args.approval_mode, "ask")
         self.assertEqual(args.sandbox, "required")
         self.assertEqual(args.sandbox_runtime, "auto")
         self.assertIsNone(args.sandbox_image)
+        self.assertTrue(args.web_access)
         self.assertFalse(args.interactive)
         self.assertFalse(args.plain)
 
@@ -52,6 +56,28 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.sandbox, "off")
         self.assertEqual(args.sandbox_runtime, "podman")
         self.assertEqual(args.sandbox_image, "local/agent:test")
+
+    def test_web_access_can_be_disabled(self) -> None:
+        args = build_parser().parse_args(["--no-web-access", "Inspect README.md"])
+
+        self.assertFalse(args.web_access)
+
+    def test_model_retry_configuration_can_be_explicit(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--model-timeout-s",
+                "180",
+                "--max-model-retries",
+                "5",
+                "--retry-base-delay-s",
+                "1.5",
+                "Inspect README.md",
+            ]
+        )
+
+        self.assertEqual(args.model_timeout_s, 180.0)
+        self.assertEqual(args.max_model_retries, 5)
+        self.assertEqual(args.retry_base_delay_s, 1.5)
 
 
 if __name__ == "__main__":

@@ -40,3 +40,11 @@ class PermissionDenied(ToolError):
 class SandboxUnavailableError(ToolError):
     """A required operating-system isolation backend is unavailable."""
 
+
+class WebAccessError(ToolError):
+    """A restricted web request was invalid, unsafe, or unsuccessful."""
+
+
+class VerificationRequiredError(CodingAgentError):
+    """Workspace changes could not pass the mandatory verification gate."""
+

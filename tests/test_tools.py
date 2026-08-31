@@ -370,6 +370,11 @@ class WorkspaceMutationToolTests(unittest.TestCase):
                 "verify_project",
             ],
         )
+        for tool_name in ["write_file", "apply_patch", "delete_file", "run_command"]:
+            with self.subTest(tool=tool_name):
+                self.assertTrue(self.registry.requires_verification(tool_name))
+        self.assertFalse(self.registry.requires_verification("read_file"))
+        self.assertFalse(self.registry.requires_verification("verify_project"))
 
 
 class FileDiscoveryToolTests(unittest.TestCase):
