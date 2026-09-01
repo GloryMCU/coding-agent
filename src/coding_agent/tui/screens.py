@@ -9,14 +9,15 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Static
 
-from ..permissions import PermissionRequest
+from ..permissions import ApprovalDecision, PermissionRequest
 
 
-class ApprovalScreen(ModalScreen[bool]):
-    """Ask the user to allow one concrete operation."""
+class ApprovalScreen(ModalScreen[ApprovalDecision]):
+    """Ask the user to deny, allow once, or allow a bounded task scope."""
 
     BINDINGS = [
         Binding("y", "allow", "Allow", show=False),
+        Binding("t", "allow_task", "Allow for task", show=False),
         Binding("n", "deny", "Deny", show=False),
         Binding("escape", "deny", "Deny", show=False),
     ]
@@ -77,16 +78,24 @@ class ApprovalScreen(ModalScreen[bool]):
                 Text(self.request.description),
                 classes="approval-operation",
             )
-            yield Label("Allow this operation once?  Y allow · N/Esc deny")
+            yield Label("Y allow once · T allow for task · N/Esc deny")
             with Horizontal():
                 yield Button("Deny", id="deny", variant="error")
                 yield Button("Allow once", id="allow", variant="success")
+                yield Button("Allow for task", id="allow-task", variant="primary")
 
     def action_allow(self) -> None:
-        self.dismiss(True)
+        self.dismiss(ApprovalDecision.ALLOW_ONCE)
+
+    def action_allow_task(self) -> None:
+        self.dismiss(ApprovalDecision.ALLOW_TASK)
 
     def action_deny(self) -> None:
-        self.dismiss(False)
+        self.dismiss(ApprovalDecision.DENY)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "allow")
+        decisions = {
+            "allow": ApprovalDecision.ALLOW_ONCE,
+            "allow-task": ApprovalDecision.ALLOW_TASK,
+        }
+        self.dismiss(decisions.get(event.button.id, ApprovalDecision.DENY))

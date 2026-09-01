@@ -11,7 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from coding_agent.model import ToolCall
-from coding_agent.permissions import DenyApprovalPolicy, PermissionRequest
+from coding_agent.permissions import (
+    DenyApprovalPolicy,
+    PermissionRequest,
+    create_approval_policy,
+)
 from coding_agent.tools import create_read_only_registry, create_workspace_registry
 
 
@@ -594,6 +598,39 @@ class ApprovalAndCommandToolTests(unittest.TestCase):
         self.assertIn("not approved", write.error or "")
         self.assertFalse((self.workspace / "denied.txt").exists())
         self.assertEqual([request.tool_name for request in policy.requests], ["write_file"])
+
+    def test_workspace_mode_writes_without_prompt_but_still_asks_to_delete(self) -> None:
+        reviewer = RecordingApprovalPolicy(approved=False)
+        registry = create_workspace_registry(
+            self.workspace,
+            approval_policy=create_approval_policy(
+                "workspace",
+                reviewer=reviewer,
+            ),
+        )
+
+        written = registry.execute(
+            ToolCall(
+                id="write",
+                name="write_file",
+                arguments={"path": "created.txt", "content": "created\n"},
+            )
+        )
+        deleted = registry.execute(
+            ToolCall(
+                id="delete",
+                name="delete_file",
+                arguments={"path": "created.txt"},
+            )
+        )
+
+        self.assertTrue(written.ok, written.error)
+        self.assertFalse(deleted.ok)
+        self.assertTrue((self.workspace / "created.txt").exists())
+        self.assertEqual(
+            [request.tool_name for request in reviewer.requests],
+            ["delete_file"],
+        )
 
     def test_controlled_command_uses_argv_and_captures_output(self) -> None:
         policy = RecordingApprovalPolicy(approved=True)

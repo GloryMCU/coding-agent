@@ -25,7 +25,7 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.max_context_tokens, 131_072)
         self.assertEqual(args.context_summary_tokens, 8_192)
         self.assertEqual(args.history_search_limit, 5)
-        self.assertEqual(args.approval_mode, "ask")
+        self.assertEqual(args.approval_mode, "workspace")
         self.assertEqual(args.sandbox, "required")
         self.assertEqual(args.sandbox_runtime, "auto")
         self.assertIsNone(args.sandbox_image)

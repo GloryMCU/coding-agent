@@ -144,6 +144,7 @@ coding-agent --max-context-tokens 262144 --context-summary-tokens 16384 `
   --workspace . "继续长会话"
 coding-agent --history-search-limit 8 --workspace . "回顾之前的数据库决策"
 coding-agent --approval-mode deny --workspace . "只读分析这个仓库"
+coding-agent --approval-mode ask --workspace . "逐项审查这个不可信仓库"
 coding-agent --approval-mode allow --workspace . "运行测试并修复失败"
 coding-agent --sandbox-image coding-agent-sandbox:python --workspace . "运行测试"
 coding-agent --model-timeout-s 180 --max-model-retries 5 `
@@ -161,10 +162,17 @@ coding-agent --model-timeout-s 180 --max-model-retries 5 `
 HTTP 408/409/425/429、5xx 和没有 HTTP 状态码的传输错误会重试；400、401、403、404、
 422 等永久请求错误会立即停止，并在 CLI/TUI 中显示简洁的可操作错误信息。
 
-`--approval-mode` 默认是 `ask`：每次文件写入、补丁、永久删除或命令执行都会在
-终端显示具体操作，并只允许单次确认；交互界面使用不会阻塞页面的审批弹窗。`deny`
-适合完全只读的无人值守分析；`allow`
-仅适合已经信任任务和仓库的自动化环境。读取、文件枚举和专用只读 Git 工具不提示。
+`--approval-mode` 默认是 `workspace`：工作区内的文件创建/修改和 OS 沙箱内的命令、
+验证自动执行；专用 `delete_file` 操作和脱离 OS 沙箱的命令仍要求审批。沙箱命令仍可
+修改或删除工作区内容，因此该模式信任工作区边界，而不是保证逐文件无破坏。`ask` 保留原有的逐项审批，
+`deny` 适合完全只读的无人值守分析，`allow` 仅适合已经信任任务和仓库的自动化环境。
+读取、文件枚举和专用只读 Git 工具不提示。
+
+CLI 审批提示和 TUI 弹窗均支持“允许一次”与“本任务内允许”。任务授权只复用于同一
+次顶层 Agent 任务的受限 scope，例如工作区写入、删除或同一命令程序；下一次
+`Agent.run()` 开始时自动清空。权限规则可以同时按操作类型、工具名、资源 glob、命令
+前缀和沙箱状态匹配；冲突时固定采用 `deny > ask > allow`，因此宽泛允许规则不能覆盖
+更具体的拒绝或询问规则。
 
 ## 交互式终端界面
 
@@ -300,7 +308,8 @@ Python 自动发现不再仅因存在 `pyproject.toml` 就假定已安装 `pytho
 
 验证类别是 `test`、`build`、`format_check` 或 `all`。格式化只使用检查模式，不会
 自动重写源文件；未检测到相应配置时通过 `skipped_checks` 明确报告，`complete` 也会
-保持为 false。每次验证计划作为一个完整操作请求用户审批。
+保持为 false。每次验证计划作为一个完整权限操作处理；默认 `workspace` 模式会自动
+执行沙箱内验证，`ask` 模式仍会请求用户审批。
 
 成功执行 `write_file`、`apply_patch`、`delete_file` 或可能改变工作区的
 `run_command` 后，Agent 核心会设置强制验证状态。模型给出最终回答时，核心先自动
@@ -323,7 +332,9 @@ Python 自动发现不再仅因存在 `pyproject.toml` 就假定已安装 `pytho
 `.coding-agent-verification.toml` 验证策略禁止通过变更工具修改。
 `create_read_only_registry` 可供只读嵌入场景使用；CLI 默认使用
 `create_workspace_registry`。嵌入方可以注入自定义 `ApprovalPolicy`，或使用内置的
-`InteractiveApprovalPolicy`、`DenyApprovalPolicy`、`AllowAllApprovalPolicy`。
+`create_approval_policy`、`PermissionRuleEngine`、`InteractiveApprovalPolicy`、
+`DenyApprovalPolicy`、`AllowAllApprovalPolicy`。规则引擎只在至少一条规则匹配时比较
+匹配结果；没有匹配时使用策略默认值。
 不注入策略时保持 Python API 的向后兼容行为；CLI 始终显式注入所选策略。
 
 默认事件日志写入 `.coding-agent/events.jsonl`，该目录不会提交到 Git。JSONL 边界会

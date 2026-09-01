@@ -19,10 +19,10 @@ from ..agent import Agent, AgentResult
 from ..errors import CodingAgentError
 from ..events import EventSink
 from ..permissions import (
-    AllowAllApprovalPolicy,
+    ApprovalDecision,
     ApprovalPolicy,
-    DenyApprovalPolicy,
     PermissionRequest,
+    create_approval_policy,
 )
 from .bridge import TuiApprovalPolicy, TuiEventSink
 from .screens import ApprovalScreen
@@ -127,13 +127,15 @@ class CodingAgentApp(App[None]):
         agent_factory: AgentFactory,
         workspace: str | Path,
         model_name: str,
-        approval_mode: str = "ask",
+        approval_mode: str = "workspace",
         session_id: str | None = None,
         initial_prompt: str | None = None,
     ) -> None:
         super().__init__()
-        if approval_mode not in {"ask", "deny", "allow"}:
-            raise ValueError("approval_mode must be ask, deny, or allow")
+        if approval_mode not in {"workspace", "ask", "deny", "allow"}:
+            raise ValueError(
+                "approval_mode must be workspace, ask, deny, or allow"
+            )
         self.agent_factory = agent_factory
         self.workspace = Path(workspace).resolve()
         self.model_name = model_name
@@ -171,14 +173,14 @@ class CodingAgentApp(App[None]):
 
     def on_mount(self) -> None:
         event_sink = TuiEventSink(self)
-        approval_policy: ApprovalPolicy
-        if self.approval_mode == "ask":
+        reviewer: ApprovalPolicy | None = None
+        if self.approval_mode in {"workspace", "ask"}:
             self.tui_approval = TuiApprovalPolicy(self)
-            approval_policy = self.tui_approval
-        elif self.approval_mode == "deny":
-            approval_policy = DenyApprovalPolicy()
-        else:
-            approval_policy = AllowAllApprovalPolicy()
+            reviewer = self.tui_approval
+        approval_policy = create_approval_policy(
+            self.approval_mode,
+            reviewer=reviewer,
+        )
         self.agent = self.agent_factory(event_sink, approval_policy)
         self._refresh_context()
         self._conversation().write(
@@ -301,16 +303,16 @@ class CodingAgentApp(App[None]):
     def show_approval(
         self,
         request: PermissionRequest,
-        future: Future[bool],
+        future: Future[ApprovalDecision],
     ) -> None:
         self._set_activity(f"Waiting for approval · {request.tool_name}")
 
-        def resolved(approved: bool | None) -> None:
-            decision = bool(approved)
+        def resolved(decision: ApprovalDecision | None) -> None:
+            decision = decision or ApprovalDecision.DENY
             if not future.done():
                 future.set_result(decision)
             self._set_activity(
-                f"{'Allowed' if decision else 'Denied'} · "
+                f"{'Denied' if decision is ApprovalDecision.DENY else 'Allowed'} · "
                 f"{_friendly_tool_name(request.tool_name)}"
             )
 

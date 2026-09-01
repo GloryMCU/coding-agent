@@ -116,6 +116,7 @@ class Agent:
     ) -> AgentResult:
         if not user_input.strip():
             raise ValueError("user_input must not be empty")
+        self._tools.begin_task()
         if self._store is not None:
             if conversation is not None:
                 raise ValueError(

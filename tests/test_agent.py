@@ -17,6 +17,8 @@ from coding_agent.errors import (
 from coding_agent.execution import ControlledCommandRunner
 from coding_agent.events import CompositeEventSink, JsonlEventSink
 from coding_agent.model import ModelResponse, ToolCall
+from coding_agent.permissions import PermissionRequest
+from coding_agent.storage import SqliteConversationStore
 from coding_agent.tools import (
     ToolDefinition,
     ToolRegistry,
@@ -152,6 +154,31 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(tool_message["role"], "tool")
         self.assertEqual(tool_message["tool_call_id"], "call-1")
         self.assertIn("A tiny project", tool_message["content"])
+
+    def test_each_agent_run_starts_a_new_approval_task(self) -> None:
+        class TaskAwarePolicy:
+            def __init__(self) -> None:
+                self.tasks_started = 0
+
+            def begin_task(self) -> None:
+                self.tasks_started += 1
+
+            def approve(self, request: PermissionRequest) -> bool:
+                return True
+
+        policy = TaskAwarePolicy()
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(text="First complete"),
+                ModelResponse.from_parts(text="Second complete"),
+            ]
+        )
+        agent = Agent(model=model, tools=ToolRegistry(approval_policy=policy))
+
+        agent.run("First task")
+        agent.run("Second task")
+
+        self.assertEqual(policy.tasks_started, 2)
 
     def test_agent_can_create_a_file_with_workspace_tools(self) -> None:
         (self.workspace / "pyproject.toml").write_text(

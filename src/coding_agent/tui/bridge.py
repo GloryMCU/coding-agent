@@ -6,7 +6,7 @@ from concurrent.futures import Future
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Callable
 
-from ..permissions import ApprovalPolicy, PermissionRequest
+from ..permissions import ApprovalDecision, ApprovalPolicy, PermissionRequest
 
 if TYPE_CHECKING:
     from .app import CodingAgentApp
@@ -31,11 +31,11 @@ class TuiApprovalPolicy(ApprovalPolicy):
 
     def __init__(self, app: CodingAgentApp) -> None:
         self._app = app
-        self._pending: set[Future[bool]] = set()
+        self._pending: set[Future[ApprovalDecision]] = set()
         self._lock = Lock()
 
-    def approve(self, request: PermissionRequest) -> bool:
-        future: Future[bool] = Future()
+    def approve(self, request: PermissionRequest) -> ApprovalDecision:
+        future: Future[ApprovalDecision] = Future()
         with self._lock:
             self._pending.add(future)
         self._app.call_from_thread(
@@ -56,4 +56,4 @@ class TuiApprovalPolicy(ApprovalPolicy):
             pending = tuple(self._pending)
         for future in pending:
             if not future.done():
-                future.set_result(False)
+                future.set_result(ApprovalDecision.DENY)

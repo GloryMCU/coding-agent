@@ -13,10 +13,9 @@ from .errors import CodingAgentError, SandboxUnavailableError
 from .execution import ControlledCommandRunner, discover_container_sandbox
 from .model import DeepSeekV4ProClient
 from .permissions import (
-    AllowAllApprovalPolicy,
     ApprovalPolicy,
-    DenyApprovalPolicy,
     InteractiveApprovalPolicy,
+    create_approval_policy,
 )
 from .storage import SqliteConversationStore
 from .tools import create_workspace_registry
@@ -86,11 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--approval-mode",
-        choices=("ask", "deny", "allow"),
-        default="ask",
+        choices=("workspace", "ask", "deny", "allow"),
+        default="workspace",
         help=(
-            "Policy for file changes and command execution: ask, deny, or allow "
-            "(default: ask)"
+            "Policy for file changes and command execution: workspace, ask, deny, "
+            "or allow (default: workspace)"
         ),
     )
     parser.add_argument(
@@ -265,11 +264,10 @@ def main() -> int:
         app.run()
         return 0
 
-    approval_policy = {
-        "ask": InteractiveApprovalPolicy,
-        "deny": DenyApprovalPolicy,
-        "allow": AllowAllApprovalPolicy,
-    }[args.approval_mode]()
+    approval_policy = create_approval_policy(
+        args.approval_mode,
+        reviewer=InteractiveApprovalPolicy(),
+    )
     agent = make_agent(NullEventSink(), approval_policy)
     assert args.prompt is not None
     return _run_plain(agent, args.prompt, args.session_id)

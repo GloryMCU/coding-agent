@@ -29,6 +29,7 @@ from .permissions import (
     ApprovalPolicy,
     PermissionKind,
     PermissionRequest,
+    approval_result_is_allowed,
 )
 from .policy import WorkspacePolicy
 from .web_tools import WebAccessClient
@@ -98,6 +99,13 @@ class ToolRegistry:
         definition = self._tools.get(tool_name)
         return bool(definition and definition.requires_verification)
 
+    def begin_task(self) -> None:
+        """Reset approval state whose lifetime is one top-level agent task."""
+
+        begin_task = getattr(self._approval_policy, "begin_task", None)
+        if callable(begin_task):
+            begin_task()
+
     def execute(self, call: ToolCall) -> ToolExecutionResult:
         definition = self._tools.get(call.name)
         if definition is None:
@@ -112,7 +120,9 @@ class ToolRegistry:
             validate_json_value(definition.parameters, call.arguments, path="arguments")
             if definition.permission is not None and self._approval_policy is not None:
                 request = definition.permission(call.arguments)
-                if not self._approval_policy.approve(request):
+                if not approval_result_is_allowed(
+                    self._approval_policy.approve(request)
+                ):
                     raise PermissionDenied(
                         f"{request.kind.value} operation was not approved: "
                         f"{request.description}"
@@ -1008,6 +1018,8 @@ def create_workspace_registry(
                 tool_name="write_file",
                 kind=PermissionKind.WRITE,
                 description=f"write workspace file {arguments['path']!r}",
+                resource=arguments["path"],
+                task_scope="workspace:write",
             ),
             requires_verification=True,
         )
@@ -1101,6 +1113,8 @@ def create_workspace_registry(
                 tool_name="apply_patch",
                 kind=PermissionKind.WRITE,
                 description=f"modify workspace file {arguments['path']!r}",
+                resource=arguments["path"],
+                task_scope="workspace:write",
             ),
             requires_verification=True,
         )
@@ -1164,6 +1178,8 @@ def create_workspace_registry(
                 tool_name="delete_file",
                 kind=PermissionKind.DELETE,
                 description=f"permanently delete workspace file {arguments['path']!r}",
+                resource=arguments["path"],
+                task_scope="workspace:delete",
             ),
             requires_verification=True,
         )
@@ -1187,6 +1203,10 @@ def create_workspace_registry(
                 f"run argv={argv!r} in cwd={arguments.get('cwd', '.')!r} "
                 f"(os_sandbox={command_runner.sandboxed})"
             ),
+            resource=arguments.get("cwd", "."),
+            command=tuple(argv),
+            sandboxed=command_runner.sandboxed,
+            task_scope=f"workspace:execute:{Path(argv[0]).stem.casefold()}",
         )
 
     def run_command(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1250,6 +1270,9 @@ def create_workspace_registry(
             tool_name="verify_project",
             kind=PermissionKind.EXECUTE,
             description=rendered or "inspect verification configuration (no command detected)",
+            resource=".",
+            sandboxed=command_runner.sandboxed,
+            task_scope="workspace:verify",
         )
 
     def verify_project(arguments: dict[str, Any]) -> dict[str, Any]:

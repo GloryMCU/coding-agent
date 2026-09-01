@@ -8,7 +8,11 @@ are trusted.
 
 - File tools reject absolute paths, workspace traversal, protected agent/Git state,
   and unsafe symbolic-link targets.
-- Mutations require explicit approval in the default CLI mode and use atomic writes.
+- The default `workspace` policy automatically allows bounded workspace writes and
+  sandboxed commands, while the dedicated `delete_file` tool and unsandboxed execution
+  require approval. Sandboxed commands can still modify or delete files inside the
+  writable workspace. File-tool mutations use atomic writes, and immutable path
+  controls remain enforced regardless of approval mode.
 - The CLI fails closed unless commands can run in a pre-existing trusted Docker or
   Podman image. The container has no network, a read-only root filesystem, no added
   capabilities or privilege escalation, a non-root numeric user, bounded resources,
@@ -40,8 +44,10 @@ container engine, OCI runtime, host kernel, and administrator-selected image. A 
 daemon commonly has powerful host privileges; prefer rootless Docker/Podman and a
 disposable VM or dedicated host for hostile workloads. The workspace remains writable
 inside the container, so an approved command can alter its source files. Review the
-complete argv shown by the approval prompt and keep approval mode at `ask` for
-untrusted input.
+complete argv shown by the approval prompt and use the stricter `ask` mode for
+  untrusted input. Task-scoped approvals are cleared before the next top-level task;
+  permission-rule conflicts resolve to the most restrictive result (`deny > ask >
+  allow`).
 
 Images are never pulled automatically. Build or obtain them through a controlled
 supply-chain process, pin their base layers by digest where practical, scan them, and

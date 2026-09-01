@@ -12,12 +12,18 @@ from .model import (
     ToolCall,
 )
 from .permissions import (
+    ApprovalDecision,
     AllowAllApprovalPolicy,
     ApprovalPolicy,
     DenyApprovalPolicy,
     InteractiveApprovalPolicy,
     PermissionKind,
     PermissionRequest,
+    PermissionRule,
+    PermissionRuleDecision,
+    PermissionRuleEngine,
+    RuleBasedApprovalPolicy,
+    create_approval_policy,
 )
 from .tools import ToolRegistry, create_read_only_registry, create_workspace_registry
 from .storage import HistorySearchResult, SqliteConversationStore
@@ -41,9 +47,14 @@ __all__ = [
     "OpenAIChatClient",
     "PermissionKind",
     "PermissionRequest",
+    "PermissionRule",
+    "PermissionRuleDecision",
+    "PermissionRuleEngine",
+    "RuleBasedApprovalPolicy",
     "ToolCall",
     "ToolRegistry",
     "SqliteConversationStore",
     "create_read_only_registry",
+    "create_approval_policy",
     "create_workspace_registry",
 ]

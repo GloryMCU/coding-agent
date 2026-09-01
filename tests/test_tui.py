@@ -12,7 +12,11 @@ try:
     from coding_agent.agent import AgentResult
     from coding_agent.conversation import ConversationState
     from coding_agent.errors import ModelRequestError
-    from coding_agent.permissions import PermissionKind, PermissionRequest
+    from coding_agent.permissions import (
+        ApprovalDecision,
+        PermissionKind,
+        PermissionRequest,
+    )
     from coding_agent.tui import CodingAgentApp
     from coding_agent.tui.screens import ApprovalScreen
 except ModuleNotFoundError as exc:
@@ -251,7 +255,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             kind=PermissionKind.EXECUTE,
             description="run argv=['python', '-m', 'unittest']",
         )
-        future: Future[bool] = Future()
+        future: Future[ApprovalDecision] = Future()
 
         async with app.run_test(size=(100, 32)) as pilot:
             app.show_approval(request, future)
@@ -260,7 +264,28 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, ApprovalScreen)
             await pilot.click("#allow")
             await pilot.pause()
-            self.assertTrue(future.result(timeout=1))
+            self.assertEqual(
+                future.result(timeout=1), ApprovalDecision.ALLOW_ONCE
+            )
+
+    async def test_approval_modal_can_allow_for_task(self) -> None:
+        app = self.make_app()
+        request = PermissionRequest(
+            tool_name="delete_file",
+            kind=PermissionKind.DELETE,
+            description="delete old.py",
+        )
+        future: Future[ApprovalDecision] = Future()
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.show_approval(request, future)
+            await pilot.pause()
+            await pilot.click("#allow-task")
+            await pilot.pause()
+
+            self.assertEqual(
+                future.result(timeout=1), ApprovalDecision.ALLOW_TASK
+            )
 
     async def test_agent_worker_waits_for_tui_approval(self) -> None:
         approval_stub: ApprovalStubAgent | None = None
