@@ -111,7 +111,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             context = str(app.query_one("#context-bar", Static).render())
 
-            self.assertIn(str(self.workspace), context)
+            self.assertIn(str(app.workspace), context)
             self.assertIn("fake-model", context)
             self.assertFalse(app.busy)
 
