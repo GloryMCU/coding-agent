@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -141,8 +142,71 @@ class SearchTextToolTests(unittest.TestCase):
         self.assertEqual(main_match["column_number"], 13)
         self.assertEqual(main_match["end_column_number"], 17)
         self.assertEqual(main_match["matched_text"], "Hello")
-        self.assertEqual(result.output["skipped_binary_files"], 1)
+        if result.output["search_backend"] == "python":
+            self.assertEqual(result.output["skipped_binary_files"], 1)
+            self.assertTrue(result.output["search_statistics_complete"])
+        else:
+            self.assertEqual(result.output["search_backend"], "ripgrep")
+            self.assertFalse(result.output["search_statistics_complete"])
         self.assertFalse(result.output["truncated"])
+
+    @unittest.skipUnless(shutil.which("rg"), "ripgrep is not installed")
+    def test_prefers_ripgrep_and_respects_gitignore(self) -> None:
+        subprocess.run(
+            ["git", "init", "-q", str(self.workspace)],
+            check=True,
+            capture_output=True,
+        )
+        (self.workspace / ".gitignore").write_text(
+            "ignored.txt\n", encoding="utf-8"
+        )
+        (self.workspace / "ignored.txt").write_text(
+            "hello from ignored file\n", encoding="utf-8"
+        )
+
+        result = self.search(query="hello")
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["search_backend"], "ripgrep")
+        self.assertNotIn(
+            "ignored.txt", {match["path"] for match in result.output["matches"]}
+        )
+
+    def test_falls_back_to_python_when_ripgrep_is_unavailable(self) -> None:
+        with patch("coding_agent.tools.shutil.which", return_value=None):
+            result = self.search(query="hello")
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["search_backend"], "python")
+        self.assertEqual(
+            result.output["ripgrep_fallback_reason"], "ripgrep_not_found"
+        )
+        self.assertTrue(result.output["search_statistics_complete"])
+
+    def test_refuses_a_workspace_local_ripgrep_executable(self) -> None:
+        fake_ripgrep = self.workspace / "rg.exe"
+        fake_ripgrep.write_bytes(b"not an executable")
+        with patch(
+            "coding_agent.tools.shutil.which", return_value=str(fake_ripgrep)
+        ):
+            result = self.search(query="hello")
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["search_backend"], "python")
+        self.assertEqual(
+            result.output["ripgrep_fallback_reason"], "ripgrep_inside_workspace"
+        )
+
+    @unittest.skipUnless(shutil.which("rg"), "ripgrep is not installed")
+    def test_falls_back_for_python_regex_unsupported_by_ripgrep(self) -> None:
+        result = self.search(query=r"(?=hello)hello", regex=True)
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["search_backend"], "python")
+        self.assertEqual(
+            result.output["ripgrep_fallback_reason"], "ripgrep_search_failed"
+        )
+        self.assertGreater(result.output["match_count"], 0)
 
     def test_can_limit_path_glob_and_case(self) -> None:
         result = self.search(
@@ -155,6 +219,17 @@ class SearchTextToolTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.output["match_count"], 1)
         self.assertEqual(result.output["matches"][0]["path"], "src/main.py")
+
+    def test_reports_character_columns_for_unicode_text(self) -> None:
+        (self.workspace / "unicode.txt").write_text(
+            "前缀 hello\n", encoding="utf-8"
+        )
+
+        result = self.search(query="hello", path="unicode.txt")
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["matches"][0]["column_number"], 4)
+        self.assertEqual(result.output["matches"][0]["end_column_number"], 8)
 
     def test_supports_regex_multiple_patterns_exclusions_and_context(self) -> None:
         result = self.search(

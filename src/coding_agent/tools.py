@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -587,6 +589,38 @@ def create_read_only_registry(
         except re.error as exc:
             raise ToolArgumentsError(f"invalid regular expression: {exc}") from exc
 
+        ripgrep_path, ripgrep_fallback_reason = _find_trusted_ripgrep(policy.root)
+        if ripgrep_path is not None:
+            try:
+                ripgrep_result = _search_text_with_ripgrep(
+                    executable=ripgrep_path,
+                    root=policy.root,
+                    search_path=search_path,
+                    query=query,
+                    regex=regex,
+                    case_sensitive=case_sensitive,
+                    include_patterns=include_patterns,
+                    exclude_patterns=exclude_patterns,
+                    context_lines=context_lines,
+                    max_results=max_results,
+                    max_file_bytes=max_search_file_bytes,
+                    max_output_chars=max_search_output_chars,
+                )
+            except _RipgrepFallback as exc:
+                ripgrep_fallback_reason = exc.reason
+            else:
+                return {
+                    "query": query,
+                    "path": policy.display_path(search_path),
+                    "regex": regex,
+                    "case_sensitive": case_sensitive,
+                    "include_patterns": include_patterns,
+                    "exclude_patterns": exclude_patterns,
+                    "search_backend": "ripgrep",
+                    "search_statistics_complete": False,
+                    **ripgrep_result,
+                }
+
         matches: list[dict[str, Any]] = []
         output_chars = 0
         output_limit_reached = False
@@ -692,6 +726,9 @@ def create_read_only_registry(
             "case_sensitive": case_sensitive,
             "include_patterns": include_patterns,
             "exclude_patterns": exclude_patterns,
+            "search_backend": "python",
+            "ripgrep_fallback_reason": ripgrep_fallback_reason,
+            "search_statistics_complete": True,
             "matches": matches,
             "match_count": len(matches),
             "files_considered": files_considered,
@@ -1323,6 +1360,267 @@ def _build_line_context(
         }
         for index in range(start, end)
     ]
+
+
+class _RipgrepFallback(Exception):
+    """Signal that search should use the in-process Python implementation."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _find_trusted_ripgrep(root: Path) -> tuple[str | None, str]:
+    executable = shutil.which("rg")
+    if executable is None:
+        return None, "ripgrep_not_found"
+    try:
+        resolved = Path(executable).resolve(strict=True)
+    except OSError:
+        return None, "ripgrep_path_invalid"
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return str(resolved), ""
+    return None, "ripgrep_inside_workspace"
+
+
+def _search_text_with_ripgrep(
+    *,
+    executable: str,
+    root: Path,
+    search_path: Path,
+    query: str,
+    regex: bool,
+    case_sensitive: bool,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    context_lines: int,
+    max_results: int,
+    max_file_bytes: int,
+    max_output_chars: int,
+) -> dict[str, Any]:
+    """Run ripgrep's JSON protocol while preserving the public search result shape."""
+
+    try:
+        target = search_path.relative_to(root)
+    except ValueError as exc:
+        raise _RipgrepFallback("search_path_outside_workspace") from exc
+
+    argv = [
+        executable,
+        "--json",
+        "--stats",
+        "--no-config",
+        "--no-messages",
+        "--color",
+        "never",
+        "--max-filesize",
+        str(max_file_bytes),
+        "--case-sensitive" if case_sensitive else "--ignore-case",
+    ]
+    if not regex:
+        argv.append("--fixed-strings")
+    for file_glob in include_patterns:
+        argv.extend(("--glob", file_glob))
+    for file_glob in exclude_patterns:
+        argv.extend(("--glob", f"!{file_glob}"))
+    argv.extend(("--", query, str(target) if target.parts else "."))
+
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise _RipgrepFallback("ripgrep_launch_failed") from exc
+
+    matches: list[dict[str, Any]] = []
+    output_chars = 0
+    output_limit_reached = False
+    stopped_early = False
+    summary_searches: int | None = None
+    matched_paths: set[str] = set()
+    context_cache: dict[Path, list[str]] = {}
+
+    assert process.stdout is not None
+    try:
+        for raw_event in process.stdout:
+            try:
+                event = json.loads(raw_event)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise _RipgrepFallback("ripgrep_invalid_json") from exc
+
+            event_type = event.get("type")
+            data = event.get("data", {})
+            if event_type == "summary":
+                searches = data.get("stats", {}).get("searches")
+                if isinstance(searches, int):
+                    summary_searches = searches
+                continue
+            if event_type != "match":
+                continue
+
+            path_text, _ = _decode_ripgrep_field(data.get("path", {}), path=True)
+            candidate, workspace_relative = _resolve_ripgrep_path(root, path_text)
+            matched_paths.add(workspace_relative)
+            line_text, line_bytes = _decode_ripgrep_field(data.get("lines", {}))
+            line_text = line_text.removesuffix("\n").removesuffix("\r")
+            line_bytes = line_bytes.removesuffix(b"\n").removesuffix(b"\r")
+            line_number = data.get("line_number")
+            if not isinstance(line_number, int) or line_number < 1:
+                raise _RipgrepFallback("ripgrep_invalid_match")
+
+            if context_lines and candidate not in context_cache:
+                context_cache[candidate] = _read_search_context_lines(
+                    candidate, max_file_bytes=max_file_bytes
+                )
+            context = (
+                _build_line_context(
+                    context_cache.get(candidate, []),
+                    line_index=line_number - 1,
+                    context_lines=context_lines,
+                )
+                if context_lines
+                else []
+            )
+
+            submatches = data.get("submatches")
+            if not isinstance(submatches, list):
+                raise _RipgrepFallback("ripgrep_invalid_match")
+            for submatch in submatches:
+                start = submatch.get("start")
+                end = submatch.get("end")
+                if (
+                    not isinstance(start, int)
+                    or not isinstance(end, int)
+                    or start < 0
+                    or end < start
+                    or end > len(line_bytes)
+                ):
+                    raise _RipgrepFallback("ripgrep_invalid_match")
+                matched_text, _ = _decode_ripgrep_field(submatch.get("match", {}))
+                column_start = len(line_bytes[:start].decode("utf-8", errors="replace"))
+                column_end = len(line_bytes[:end].decode("utf-8", errors="replace"))
+                line_excerpt, excerpt_start = _line_excerpt(line_text, column_start)
+                match = {
+                    "path": workspace_relative,
+                    "line_number": line_number,
+                    "column_number": column_start + 1,
+                    "end_column_number": max(column_end, column_start + 1),
+                    "matched_text": matched_text[:500],
+                    "matched_text_truncated": len(matched_text) > 500,
+                    "line": line_excerpt,
+                    "line_start_column": excerpt_start + 1,
+                    "line_truncated": len(line_excerpt) < len(line_text),
+                    "context": context,
+                }
+                match_chars = len(json.dumps(match, ensure_ascii=False))
+                if matches and output_chars + match_chars > max_output_chars:
+                    output_limit_reached = True
+                    stopped_early = True
+                    break
+                matches.append(match)
+                output_chars += match_chars
+                if len(matches) > max_results:
+                    stopped_early = True
+                    break
+            if stopped_early:
+                break
+    except _RipgrepFallback:
+        _stop_ripgrep(process)
+        raise
+
+    if stopped_early:
+        _stop_ripgrep(process)
+        return_code = process.returncode
+    else:
+        return_code = process.wait()
+        process.stdout.close()
+    if not stopped_early and return_code not in (0, 1):
+        raise _RipgrepFallback("ripgrep_search_failed")
+
+    result_limit_reached = len(matches) > max_results
+    truncation_reasons = []
+    if result_limit_reached:
+        truncation_reasons.append("result_limit")
+    if output_limit_reached:
+        truncation_reasons.append("output_size_limit")
+    matches = matches[:max_results]
+    files_searched = summary_searches or len(matched_paths)
+    return {
+        "matches": matches,
+        "match_count": len(matches),
+        "files_considered": files_searched,
+        "files_searched": files_searched,
+        "skipped_by_pattern": 0,
+        "skipped_binary_files": 0,
+        "skipped_outside_workspace": 0,
+        "skipped_unreadable_files": 0,
+        "truncated_files": 0,
+        "truncated": bool(truncation_reasons),
+        "truncation_reasons": truncation_reasons,
+    }
+
+
+def _decode_ripgrep_field(
+    field: Any, *, path: bool = False
+) -> tuple[str, bytes]:
+    if not isinstance(field, dict):
+        raise _RipgrepFallback("ripgrep_invalid_json")
+    text = field.get("text")
+    if isinstance(text, str):
+        return text, text.encode("utf-8")
+    encoded = field.get("bytes")
+    if not isinstance(encoded, str):
+        raise _RipgrepFallback("ripgrep_invalid_json")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise _RipgrepFallback("ripgrep_invalid_json") from exc
+    return (os.fsdecode(raw) if path else raw.decode("utf-8", errors="replace")), raw
+
+
+def _resolve_ripgrep_path(root: Path, raw_path: str) -> tuple[Path, str]:
+    reported = Path(raw_path)
+    candidate = reported if reported.is_absolute() else root / reported
+    try:
+        lexical = Path(os.path.abspath(candidate))
+        lexical.relative_to(root)
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise _RipgrepFallback("ripgrep_path_outside_workspace") from exc
+    return resolved, lexical.relative_to(root).as_posix()
+
+
+def _read_search_context_lines(path: Path, *, max_file_bytes: int) -> list[str]:
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(max_file_bytes + 1)
+    except OSError:
+        return []
+    if len(raw) > max_file_bytes or b"\x00" in raw:
+        return []
+    return raw.decode("utf-8", errors="replace").splitlines()
+
+
+def _stop_ripgrep(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+    if process.stdout is not None:
+        process.stdout.close()
 
 
 def _iter_search_files(search_path: Path) -> Iterator[Path]:

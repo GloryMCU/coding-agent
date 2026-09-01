@@ -226,6 +226,13 @@ python -m coding_agent --workspace . "读取 README.md"
 跳过统计。二进制文件、版本控制目录、依赖目录和常见缓存目录默认跳过；路径穿越与
 绝对路径仍由工作区沙箱拦截。
 
+`search_text` 会自动探测 PATH 中位于工作区外的 `rg`，优先通过 ripgrep 的 JSON 协议执行搜索，
+因此大型 Git 工作区能够利用并行遍历、`.gitignore` 和 ripgrep 的高性能匹配；参数
+校验、路径沙箱、文件大小及结果大小上限仍由 Python 层控制。如果未安装 ripgrep、
+启动失败，或 Python 正则包含 ripgrep 不支持的语法，工具会自动回退到原有 Python
+实现。结果中的 `search_backend` 表示实际后端；ripgrep 无法提供逐类跳过文件计数时，
+`search_statistics_complete` 为 `false`，这些分类计数保守返回 `0`。
+
 文件发现使用两个独立工具：
 
 - `list_files` 列出目录的直接文件或全部后代，返回相对路径和字节数；
