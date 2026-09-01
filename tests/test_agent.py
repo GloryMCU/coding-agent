@@ -336,6 +336,36 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.text, "Recovered")
         self.assertEqual(len(model.requests), 2)
 
+    def test_permanent_model_request_error_is_not_retried(self) -> None:
+        events = RecordingEventSink()
+        error = ModelRequestError(
+            "model authentication failed",
+            retryable=False,
+            status_code=401,
+        )
+        model = FakeModel([error])
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            config=AgentConfig(max_model_retries=5, retry_base_delay_s=0),
+            events=events,
+        )
+
+        with self.assertRaises(ModelRequestError) as raised:
+            agent.run("Hello")
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(len(model.requests), 1)
+        request_errors = [
+            payload
+            for event_type, payload in events.events
+            if event_type == "model_request_error"
+        ]
+        self.assertEqual(len(request_errors), 1)
+        self.assertFalse(request_errors[0]["retryable"])
+        self.assertFalse(request_errors[0]["will_retry"])
+        self.assertEqual(request_errors[0]["status_code"], 401)
+
     def test_max_steps_terminates_agent(self) -> None:
         model = FakeModel(
             [

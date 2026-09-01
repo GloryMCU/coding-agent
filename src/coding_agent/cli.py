@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .agent import Agent, AgentConfig
 from .events import CompositeEventSink, EventSink, JsonlEventSink, NullEventSink
-from .errors import SandboxUnavailableError
+from .errors import CodingAgentError, SandboxUnavailableError
 from .execution import ControlledCommandRunner, discover_container_sandbox
 from .model import DeepSeekV4ProClient
 from .permissions import (
@@ -210,12 +210,15 @@ def main() -> int:
         if args.event_log is not None
         else workspace / ".coding-agent" / "events.jsonl"
     )
-    model = DeepSeekV4ProClient(
-        api_key=api_key,
-        base_url=args.base_url,
-        thinking=args.thinking,
-        reasoning_effort=args.reasoning_effort,
-    )
+    try:
+        model = DeepSeekV4ProClient(
+            api_key=api_key,
+            base_url=args.base_url,
+            thinking=args.thinking,
+            reasoning_effort=args.reasoning_effort,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"model configuration error: {exc}") from exc
     audit_events = JsonlEventSink(event_log_path)
 
     def make_agent(events: EventSink, approval_policy: ApprovalPolicy) -> Agent:
@@ -269,7 +272,18 @@ def main() -> int:
     }[args.approval_mode]()
     agent = make_agent(NullEventSink(), approval_policy)
     assert args.prompt is not None
-    result = agent.run(args.prompt, session_id=args.session_id)
+    return _run_plain(agent, args.prompt, args.session_id)
+
+
+def _run_plain(agent: Agent, prompt: str, session_id: str | None) -> int:
+    try:
+        result = agent.run(prompt, session_id=session_id)
+    except CodingAgentError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
     print(result.text)
     print(f"session_id: {result.session_id}", file=sys.stderr)
     return 0

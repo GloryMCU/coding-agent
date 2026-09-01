@@ -11,8 +11,10 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
+openai = ["openai>=1.0"]
 deepseek = ["openai>=1.0"]
 tui = ["textual>=1.0"]
+dev = ["build>=1.2", "openai>=1.0", "textual>=1.0"]
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"

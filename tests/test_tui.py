@@ -11,6 +11,7 @@ try:
 
     from coding_agent.agent import AgentResult
     from coding_agent.conversation import ConversationState
+    from coding_agent.errors import ModelRequestError
     from coding_agent.permissions import PermissionKind, PermissionRequest
     from coding_agent.tui import CodingAgentApp
     from coding_agent.tui.screens import ApprovalScreen
@@ -70,6 +71,15 @@ class ApprovalStubAgent(StubAgent):
             )
         )
         return super().run(prompt, session_id=session_id)
+
+
+class FailingStubAgent(StubAgent):
+    def run(self, prompt: str, *, session_id: str | None = None) -> AgentResult:
+        raise ModelRequestError(
+            "model authentication failed (HTTP 401)",
+            retryable=False,
+            status_code=401,
+        )
 
 
 class TuiAppTests(unittest.IsolatedAsyncioTestCase):
@@ -266,6 +276,31 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(app.session_id)
             self.assertEqual(self.stub.prompts, [])
+
+    async def test_expected_failure_is_handled_without_worker_error(self) -> None:
+        def factory(events: Any, approval: Any) -> FailingStubAgent:
+            return FailingStubAgent(events)
+
+        app = CodingAgentApp(
+            agent_factory=factory,  # type: ignore[arg-type]
+            workspace=self.workspace,
+            model_name="fake-model",
+            approval_mode="ask",
+        )
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.submit_prompt("Hello")
+            for _ in range(100):
+                await pilot.pause(0.01)
+                if not app.busy:
+                    break
+
+            rendered = "\n".join(
+                line.text for line in app.query_one("#conversation", RichLog).lines
+            )
+            self.assertFalse(app.busy)
+            self.assertIn("Agent stopped: model authentication failed", rendered)
+            self.assertNotIn("ModelRequestError", rendered)
 
 
 if __name__ == "__main__":

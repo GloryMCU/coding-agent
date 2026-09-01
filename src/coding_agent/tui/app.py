@@ -16,6 +16,7 @@ from textual.widgets import Footer, Header, RichLog, Static, TextArea
 from textual.worker import Worker
 
 from ..agent import Agent, AgentResult
+from ..errors import CodingAgentError
 from ..events import EventSink
 from ..permissions import (
     AllowAllApprovalPolicy,
@@ -139,7 +140,7 @@ class CodingAgentApp(App[None]):
         self.session_id = session_id
         self.initial_prompt = initial_prompt
         self.agent: Agent | None = None
-        self.agent_worker: Worker[AgentResult] | None = None
+        self.agent_worker: Worker[AgentResult | None] | None = None
         self.tui_approval: TuiApprovalPolicy | None = None
         self.busy = False
         self.completed_tools = 0
@@ -215,10 +216,13 @@ class CodingAgentApp(App[None]):
         self.agent_worker = self.run_agent(prompt)
 
     @work(thread=True, exclusive=True, group="agent")
-    def run_agent(self, prompt: str) -> AgentResult:
+    def run_agent(self, prompt: str) -> AgentResult | None:
         assert self.agent is not None
         try:
             result = self.agent.run(prompt, session_id=self.session_id)
+        except CodingAgentError as exc:
+            self.call_from_thread(self._turn_failed, exc)
+            return None
         except Exception as exc:
             self.call_from_thread(self._turn_failed, exc)
             raise
@@ -269,9 +273,15 @@ class CodingAgentApp(App[None]):
             return
 
         if event_type == "model_request_error":
-            self._set_activity(
-                f"Model request failed · retry {payload.get('attempt', '?')}…"
-            )
+            attempt = payload.get("attempt", "?")
+            if payload.get("will_retry"):
+                self._set_activity(
+                    f"Model request failed · retrying after attempt {attempt}…"
+                )
+            else:
+                self._set_activity(
+                    f"Model request failed · stopped after attempt {attempt}"
+                )
             return
 
         if event_type == "tool_calls_recovered":
@@ -340,8 +350,12 @@ class CodingAgentApp(App[None]):
         self._prompt().focus()
 
     def _turn_failed(self, exc: Exception) -> None:
+        if isinstance(exc, CodingAgentError):
+            message = f"Agent stopped: {exc}"
+        else:
+            message = f"Unexpected agent error ({type(exc).__name__}): {exc}"
         self._conversation().write(
-            Text(f"Agent failed: {type(exc).__name__}: {exc}", style="bold red")
+            Text(message, style="bold red")
         )
         self._set_busy(False, "Failed · ready for another task")
         self._prompt().focus()

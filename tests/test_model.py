@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from coding_agent.errors import ModelProtocolError
+from coding_agent.errors import ModelProtocolError, ModelRequestError
 from coding_agent.model import DeepSeekV4ProClient, parse_openai_message
 
 
@@ -154,6 +154,56 @@ class OpenAIMessageParserTests(unittest.TestCase):
             client = DeepSeekV4ProClient(api_key="test-key")
             with self.assertRaisesRegex(ModelProtocolError, "without any tool call"):
                 client.generate([], [], timeout_s=12)
+
+    def test_client_classifies_http_failures_for_retry(self) -> None:
+        cases = (
+            (400, False, "request rejected"),
+            (401, False, "authentication failed"),
+            (403, False, "access denied"),
+            (429, True, "rate limit"),
+            (503, True, "service unavailable"),
+        )
+        for status_code, retryable, message in cases:
+            with self.subTest(status_code=status_code):
+                error = RuntimeError("vendor detail")
+                error.status_code = status_code  # type: ignore[attr-defined]
+
+                class FakeCompletions:
+                    def create(self, **request: object) -> SimpleNamespace:
+                        raise error
+
+                fake_module = SimpleNamespace(
+                    OpenAI=lambda **kwargs: SimpleNamespace(
+                        chat=SimpleNamespace(completions=FakeCompletions())
+                    )
+                )
+                with patch.dict(sys.modules, {"openai": fake_module}):
+                    client = DeepSeekV4ProClient(api_key="test-key")
+                    with self.assertRaises(ModelRequestError) as raised:
+                        client.generate([], [], timeout_s=12)
+
+                self.assertEqual(raised.exception.status_code, status_code)
+                self.assertEqual(raised.exception.retryable, retryable)
+                self.assertIn(message, str(raised.exception))
+
+    def test_client_treats_transport_failure_as_retryable(self) -> None:
+        class FakeCompletions:
+            def create(self, **request: object) -> SimpleNamespace:
+                raise ConnectionError("stream disconnected")
+
+        fake_module = SimpleNamespace(
+            OpenAI=lambda **kwargs: SimpleNamespace(
+                chat=SimpleNamespace(completions=FakeCompletions())
+            )
+        )
+        with patch.dict(sys.modules, {"openai": fake_module}):
+            client = DeepSeekV4ProClient(api_key="test-key")
+            with self.assertRaises(ModelRequestError) as raised:
+                client.generate([], [], timeout_s=12)
+
+        self.assertTrue(raised.exception.retryable)
+        self.assertIsNone(raised.exception.status_code)
+        self.assertIn("stream disconnected", str(raised.exception))
 
 
 if __name__ == "__main__":

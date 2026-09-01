@@ -618,11 +618,20 @@ class Agent:
                 )
             except ModelRequestError as exc:
                 last_error = exc
+                will_retry = exc.retryable and attempt < attempts
                 self._events.emit(
                     "model_request_error",
-                    {"attempt": attempt, "error": str(exc)},
+                    {
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "retryable": exc.retryable,
+                        "will_retry": will_retry,
+                        "status_code": exc.status_code,
+                    },
                 )
-                if attempt < attempts:
+                if not exc.retryable:
+                    raise
+                if will_retry:
                     time.sleep(self._config.retry_base_delay_s * (2 ** (attempt - 1)))
         assert last_error is not None
         raise last_error

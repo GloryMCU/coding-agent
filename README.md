@@ -31,7 +31,7 @@
 SQLite 是会话状态的事实来源；JSONL 只用于观察和排错。模型厂商的服务端会话
 ID 不作为本地状态的事实来源。
 
-发送给模型的持久化上下文默认使用约 24,000 Token 的软预算。短会话仍发送完整
+发送给模型的持久化上下文默认使用约 128K Token 的软预算。短会话仍发送完整
 历史；超出预算后，`ContextBuilder` 按完整用户轮次保留最近内容，并把更早内容压缩
 为结构化摘要。完整原始消息不会删除，摘要单独保存在 SQLite 的
 `context_summary` 表中，因此可以重新生成。工具调用与对应结果始终作为一个整体
@@ -67,6 +67,13 @@ OpenAI Python 客户端作为 HTTP/API 传输层，不使用任何 Agent SDK：
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -e ".[deepseek,tui]"
+```
+
+只使用通用 OpenAI 兼容适配器时也可以安装 `.[openai]`。参与开发和运行完整测试、
+构建检查时使用：
+
+```powershell
+python -m pip install -e ".[dev]"
 ```
 
 设置模型配置：
@@ -140,6 +147,8 @@ coding-agent --model-timeout-s 180 --max-model-retries 5 `
 不会重复已经完成的本地工具调用。上述三个参数可用于高延迟模型或不稳定的兼容网关；
 持续出现 `stream disconnected before completion` 时还应检查代理/VPN、网关健康状态和
 `--base-url` 是否指向预期端点。
+HTTP 408/409/425/429、5xx 和没有 HTTP 状态码的传输错误会重试；400、401、403、404、
+422 等永久请求错误会立即停止，并在 CLI/TUI 中显示简洁的可操作错误信息。
 
 `--approval-mode` 默认是 `ask`：每次文件写入、补丁、永久删除或命令执行都会在
 终端显示具体操作，并只允许单次确认；交互界面使用不会阻塞页面的审批弹窗。`deny`

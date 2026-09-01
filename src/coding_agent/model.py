@@ -132,7 +132,7 @@ class OpenAIChatClient:
         try:
             completion = self._client.chat.completions.create(**request)
         except Exception as exc:  # Vendor exception types vary by client version.
-            raise ModelRequestError(f"model request failed: {exc}") from exc
+            raise _classify_model_request_error(exc) from exc
 
         if not completion.choices:
             raise ModelProtocolError("model response contains no choices")
@@ -266,3 +266,52 @@ def _model_dump(value: Any) -> dict[str, Any] | None:
         if getattr(value, name, None) is not None
     }
     return result or None
+
+
+_RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429})
+
+
+def _classify_model_request_error(exc: Exception) -> ModelRequestError:
+    """Normalize vendor exceptions without importing version-specific SDK types."""
+
+    status_code = _status_code(exc)
+    retryable = status_code is None or (
+        status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
+    )
+    detail = str(exc).strip() or type(exc).__name__
+
+    if status_code == 401:
+        message = (
+            "model authentication failed (HTTP 401): check DEEPSEEK_API_KEY "
+            "and --base-url"
+        )
+    elif status_code == 403:
+        message = (
+            "model access denied (HTTP 403): check the API key permissions and "
+            "model access"
+        )
+    elif status_code == 429:
+        message = f"model rate limit exceeded (HTTP 429): {detail}"
+    elif status_code is not None and status_code >= 500:
+        message = f"model service unavailable (HTTP {status_code}): {detail}"
+    elif status_code is not None:
+        message = f"model request rejected (HTTP {status_code}): {detail}"
+    else:
+        message = f"model transport failed: {detail}"
+
+    return ModelRequestError(
+        message,
+        retryable=retryable,
+        status_code=status_code,
+    )
+
+
+def _status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        return status_code
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        return status_code
+    return None

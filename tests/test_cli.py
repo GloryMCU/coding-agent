@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import io
 import os
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from coding_agent.cli import build_parser
+from coding_agent.cli import _run_plain, build_parser
+from coding_agent.errors import ModelRequestError
 
 
 class CliDefaultsTests(unittest.TestCase):
@@ -78,6 +82,46 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.model_timeout_s, 180.0)
         self.assertEqual(args.max_model_retries, 5)
         self.assertEqual(args.retry_base_delay_s, 1.5)
+
+
+class PlainCliTests(unittest.TestCase):
+    def test_expected_agent_failure_is_reported_without_traceback(self) -> None:
+        class FailingAgent:
+            def run(self, prompt: str, *, session_id: str | None = None) -> object:
+                raise ModelRequestError(
+                    "model authentication failed (HTTP 401)",
+                    retryable=False,
+                    status_code=401,
+                )
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            exit_code = _run_plain(  # type: ignore[arg-type]
+                FailingAgent(), "Hello", None
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: model authentication failed (HTTP 401)\n",
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_success_prints_answer_and_session(self) -> None:
+        class PassingAgent:
+            def run(self, prompt: str, *, session_id: str | None = None) -> object:
+                return SimpleNamespace(text="Done", session_id="session-1")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = _run_plain(  # type: ignore[arg-type]
+                PassingAgent(), "Hello", None
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.getvalue(), "Done\n")
+        self.assertEqual(stderr.getvalue(), "session_id: session-1\n")
 
 
 if __name__ == "__main__":
