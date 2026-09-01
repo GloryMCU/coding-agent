@@ -64,7 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable thinking mode (default: enabled)",
     )
-    parser.add_argument("--max-steps", type=int, default=10)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=30,
+        help=(
+            "Maximum model steps per task, including a final text-only handoff "
+            "step (default: 30)"
+        ),
+    )
     parser.add_argument(
         "--model-timeout-s",
         type=float,
@@ -283,6 +291,9 @@ def _run_plain(agent: Agent, prompt: str, session_id: str | None) -> int:
         print("interrupted", file=sys.stderr)
         return 130
     print(result.text)
+    status = getattr(result, "status", None)
+    if status is not None:
+        print(f"status: {getattr(status, 'value', status)}", file=sys.stderr)
     print(f"session_id: {result.session_id}", file=sys.stderr)
     return 0
 

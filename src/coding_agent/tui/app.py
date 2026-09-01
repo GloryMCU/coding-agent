@@ -295,9 +295,14 @@ class CodingAgentApp(App[None]):
             )
             return
 
+        if event_type == "no_progress_detected":
+            self._set_activity("No progress detected · preparing partial handoff")
+            return
+
         if event_type == "agent_terminated":
             self._set_activity(
-                f"Finishing · {payload.get('reason', 'completed')}"
+                f"Finishing · {payload.get('status', 'completed')} · "
+                f"{payload.get('reason', 'completed')}"
             )
 
     def show_approval(
@@ -362,7 +367,14 @@ class CodingAgentApp(App[None]):
 
     def _turn_finished(self, result: AgentResult) -> None:
         self.session_id = result.session_id or self.session_id
-        self._set_busy(False, f"Ready · {result.steps} model step(s)")
+        label = {
+            "completed": "Completed",
+            "partial": "Partial · ready to continue",
+            "blocked": "Blocked · user action needed",
+            "interrupted": "Interrupted",
+            "failed": "Failed",
+        }.get(result.status.value, result.status.value)
+        self._set_busy(False, f"{label} · {result.steps} model step(s)")
         self._refresh_context()
         self._prompt().focus()
 

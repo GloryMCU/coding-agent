@@ -143,6 +143,7 @@ coding-agent --no-thinking --workspace . "读取 README.md"
 coding-agent --max-context-tokens 262144 --context-summary-tokens 16384 `
   --workspace . "继续长会话"
 coding-agent --history-search-limit 8 --workspace . "回顾之前的数据库决策"
+coding-agent --max-steps 50 --workspace . "执行特别长的重构任务"
 coding-agent --approval-mode deny --workspace . "只读分析这个仓库"
 coding-agent --approval-mode ask --workspace . "逐项审查这个不可信仓库"
 coding-agent --approval-mode allow --workspace . "运行测试并修复失败"
@@ -161,6 +162,17 @@ coding-agent --model-timeout-s 180 --max-model-retries 5 `
 `--base-url` 是否指向预期端点。
 HTTP 408/409/425/429、5xx 和没有 HTTP 状态码的传输错误会重试；400、401、403、404、
 422 等永久请求错误会立即停止，并在 CLI/TUI 中显示简洁的可操作错误信息。
+
+每个顶层任务默认最多使用 30 个模型步骤。最后一个步骤不再提供任何工具，而是要求
+模型输出纯文本交接，明确已完成、未完成、验证状态和下一步，因此不会在预算耗尽前的
+最后一轮留下新的未验证修改。若此前存在工作区变更，核心会在最终交接前主动运行一次
+`verify_project`。正常完成状态为 `completed`；预算耗尽或检测到无进展时为 `partial`；
+验证或外部条件无法继续时为 `blocked`；用户中断和不可恢复故障分别记录为
+`interrupted`、`failed`。持久会话可以在 `partial` 或 `blocked` 后继续。
+
+无进展检测除了连续的完全相同调用，还会识别短窗口内的交替工具调用周期、同一工具
+反复产生相同错误，以及连续工具失败。触发后剩余工具调用会被安全跳过，下一模型步骤
+只生成部分交接，不会继续扩大副作用。
 
 `--approval-mode` 默认是 `workspace`：工作区内的文件创建/修改和 OS 沙箱内的命令、
 验证自动执行；专用 `delete_file` 操作和脱离 OS 沙箱的命令仍要求审批。沙箱命令仍可

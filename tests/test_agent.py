@@ -6,11 +6,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from coding_agent.agent import Agent, AgentConfig
+from coding_agent.agent import Agent, AgentConfig, AgentStatus
 from coding_agent.conversation import Message
 from coding_agent.errors import (
-    LoopDetected,
-    MaxStepsExceeded,
     ModelRequestError,
     VerificationRequiredError,
 )
@@ -31,6 +29,7 @@ class FakeModel:
     def __init__(self, responses: list[ModelResponse | Exception]) -> None:
         self.responses = list(responses)
         self.requests: list[list[Message]] = []
+        self.tool_requests: list[list[dict[str, Any]]] = []
 
     def generate(
         self,
@@ -40,6 +39,7 @@ class FakeModel:
         timeout_s: float,
     ) -> ModelResponse:
         self.requests.append(messages)
+        self.tool_requests.append(tools)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -267,6 +267,77 @@ class AgentLoopTests(unittest.TestCase):
         ]
         self.assertEqual(len(automatic_results), 1)
 
+    def test_finalization_step_proactively_verifies_pending_changes(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    text="Budget reached after the verified change; follow-up remains."
+                ),
+            ]
+        )
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry(
+                [{"ok": True, "skipped": False, "results": []}]
+            ),
+            config=AgentConfig(max_steps=2),
+        )
+
+        result = agent.run("Change the project and keep working")
+
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.termination_reason, "max_steps")
+        self.assertEqual(model.tool_requests[1], [])
+        self.assertEqual(model.requests[1][-1]["name"], "verify_project")
+        verification_result = json.loads(model.requests[1][-1]["content"])
+        self.assertTrue(verification_result["output"]["ok"])
+        self.assertIn("verification passed", model.requests[1][0]["content"])
+
+    def test_finalization_reports_blocked_when_verification_is_unavailable(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="change_file",
+                description="Simulate a mutation.",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=lambda arguments: {"changed": True},
+                requires_verification=True,
+            )
+        )
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    text="Blocked because project verification is unavailable."
+                ),
+            ]
+        )
+        agent = Agent(
+            model=model,
+            tools=registry,
+            config=AgentConfig(max_steps=2),
+        )
+
+        result = agent.run("Change the project")
+
+        self.assertEqual(result.status, AgentStatus.BLOCKED)
+        self.assertEqual(result.termination_reason, "max_steps")
+        self.assertEqual(model.tool_requests[-1], [])
+        self.assertIn("blocked or unavailable", model.requests[-1][0]["content"])
+
     def test_failed_verification_is_returned_to_model_before_retrying_final(
         self,
     ) -> None:
@@ -393,19 +464,19 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(request_errors[0]["will_retry"])
         self.assertEqual(request_errors[0]["status_code"], 401)
 
-    def test_max_steps_terminates_agent(self) -> None:
+    def test_max_steps_reserves_a_text_only_partial_handoff(self) -> None:
         model = FakeModel(
             [
                 ModelResponse.from_parts(
                     tool_calls=[
                         ToolCall(
-                            id=f"call-{index}",
+                            id="call-1",
                             name="read_file",
-                            arguments={"path": "README.md", "start_line": index + 1},
+                            arguments={"path": "README.md"},
                         )
                     ]
-                )
-                for index in range(2)
+                ),
+                ModelResponse.from_parts(text="Partial handoff with remaining work."),
             ]
         )
         agent = Agent(
@@ -414,10 +485,81 @@ class AgentLoopTests(unittest.TestCase):
             config=AgentConfig(max_steps=2),
         )
 
-        with self.assertRaises(MaxStepsExceeded):
-            agent.run("Never finish")
+        result = agent.run("Never finish")
 
-    def test_repeated_tool_call_is_detected(self) -> None:
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.termination_reason, "max_steps")
+        self.assertEqual(result.steps, 2)
+        self.assertTrue(model.tool_requests[0])
+        self.assertEqual(model.tool_requests[1], [])
+        self.assertIn("maximum model steps", model.requests[1][0]["content"])
+
+    def test_persisted_max_steps_records_partial_session_status(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            name="read_file",
+                            arguments={"path": "README.md"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(text="Persisted partial handoff."),
+            ]
+        )
+        store = SqliteConversationStore(
+            self.workspace / ".coding-agent" / "history.sqlite3"
+        )
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            config=AgentConfig(max_steps=2),
+            store=store,
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        result = agent.run("Never finish")
+
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertIsNotNone(result.session_id)
+        assert result.session_id is not None
+        self.assertEqual(store.get_session(result.session_id).status, "partial")
+
+    def test_consecutive_tool_errors_trigger_no_progress_handoff(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"bad-{index}",
+                            name=f"missing_tool_{index}",
+                            arguments={},
+                        )
+                    ]
+                )
+                for index in range(3)
+            ]
+            + [ModelResponse.from_parts(text="Stopped after repeated failures.")]
+        )
+        agent = Agent(
+            model=model,
+            tools=ToolRegistry(),
+            config=AgentConfig(
+                max_steps=8,
+                max_consecutive_tool_errors=3,
+            ),
+        )
+
+        result = agent.run("Keep trying missing tools")
+
+        self.assertEqual(result.termination_reason, "no_progress")
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.steps, 4)
+
+    def test_repeated_tool_call_returns_a_partial_handoff(self) -> None:
         call_responses = [
             ModelResponse.from_parts(
                 tool_calls=[
@@ -430,15 +572,59 @@ class AgentLoopTests(unittest.TestCase):
             )
             for index in range(3)
         ]
-        model = FakeModel(call_responses)
+        model = FakeModel(
+            [
+                *call_responses,
+                ModelResponse.from_parts(text="Stopped after detecting no progress."),
+            ]
+        )
         agent = Agent(
             model=model,
             tools=create_read_only_registry(self.workspace),
             config=AgentConfig(max_steps=5, repeated_tool_call_limit=2),
         )
 
-        with self.assertRaises(LoopDetected):
-            agent.run("Repeat forever")
+        result = agent.run("Repeat forever")
+
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.termination_reason, "no_progress")
+        self.assertEqual(result.steps, 4)
+        self.assertEqual(model.tool_requests[-1], [])
+        tool_messages = [
+            message for message in result.conversation.messages if message["role"] == "tool"
+        ]
+        self.assertIn("not executed", tool_messages[-1]["content"])
+
+    def test_alternating_tool_cycle_is_detected(self) -> None:
+        calls = [
+            ModelResponse.from_parts(
+                tool_calls=[
+                    ToolCall(
+                        id=f"call-{index}",
+                        name="read_file",
+                        arguments={
+                            "path": "README.md",
+                            "start_line": 1 if index % 2 == 0 else 2,
+                        },
+                    )
+                ]
+            )
+            for index in range(6)
+        ]
+        model = FakeModel(
+            [*calls, ModelResponse.from_parts(text="Alternating cycle stopped.")]
+        )
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            config=AgentConfig(max_steps=10, repeated_tool_call_limit=2),
+        )
+
+        result = agent.run("Alternate forever")
+
+        self.assertEqual(result.termination_reason, "no_progress")
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.steps, 7)
 
     def test_jsonl_event_log_records_termination(self) -> None:
         log_path = self.workspace / ".coding-agent" / "events.jsonl"

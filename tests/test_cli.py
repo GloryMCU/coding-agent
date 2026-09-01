@@ -7,6 +7,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from coding_agent.agent import AgentStatus
 from coding_agent.cli import _run_plain, build_parser
 from coding_agent.errors import ModelRequestError
 
@@ -19,6 +20,7 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.base_url, "https://api.deepseek.com")
         self.assertEqual(args.reasoning_effort, "high")
         self.assertTrue(args.thinking)
+        self.assertEqual(args.max_steps, 30)
         self.assertEqual(args.model_timeout_s, 60.0)
         self.assertEqual(args.max_model_retries, 2)
         self.assertEqual(args.retry_base_delay_s, 0.5)
@@ -110,7 +112,11 @@ class PlainCliTests(unittest.TestCase):
     def test_success_prints_answer_and_session(self) -> None:
         class PassingAgent:
             def run(self, prompt: str, *, session_id: str | None = None) -> object:
-                return SimpleNamespace(text="Done", session_id="session-1")
+                return SimpleNamespace(
+                    text="Done",
+                    session_id="session-1",
+                    status=AgentStatus.COMPLETED,
+                )
 
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -121,7 +127,10 @@ class PlainCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stdout.getvalue(), "Done\n")
-        self.assertEqual(stderr.getvalue(), "session_id: session-1\n")
+        self.assertEqual(
+            stderr.getvalue(),
+            "status: completed\nsession_id: session-1\n",
+        )
 
 
 if __name__ == "__main__":

@@ -635,7 +635,14 @@ class SqliteConversationStore:
     def set_session_status(
         self, session_id: str, status: str, *, error: str | None = None
     ) -> None:
-        if status not in {"active", "completed", "error"}:
+        if status not in {
+            "active",
+            "completed",
+            "partial",
+            "blocked",
+            "interrupted",
+            "failed",
+        }:
             raise ValueError(f"invalid session status: {status}")
         with self._transaction() as connection:
             cursor = connection.execute(

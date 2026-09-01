@@ -5,15 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+from typing import Sequence
 from uuid import uuid4
 
 from .conversation import ConversationState, Message
 from .context import ContextBuilder, ContextConfig
 from .errors import (
-    LoopDetected,
-    MaxStepsExceeded,
     ModelProtocolError,
     ModelRequestError,
     VerificationRequiredError,
@@ -35,13 +36,35 @@ Workspace changes are subject to a core-enforced verification gate. After changi
 When the task is complete, respond with a concise final answer and do not call another tool."""
 
 
+FINALIZATION_PROMPT = """The agent execution budget has reached its final response step.
+You cannot call tools in this response. Give the user a truthful text-only handoff that:
+- states that execution stopped before another tool round could begin;
+- summarizes completed work and available verification evidence;
+- lists unfinished or unverified work;
+- recommends the most useful next action.
+Do not claim the task is complete unless the conversation already contains sufficient evidence.
+Finalization reason: {reason}
+Verification state: {verification_state}
+"""
+
+
+class AgentStatus(StrEnum):
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    INTERRUPTED = "interrupted"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
-    max_steps: int = 10
+    max_steps: int = 30
     model_timeout_s: float = 60.0
     max_model_retries: int = 2
     retry_base_delay_s: float = 0.5
     repeated_tool_call_limit: int = 3
+    no_progress_window: int = 12
+    max_consecutive_tool_errors: int = 4
     max_context_tokens: int = 131_072
     context_summary_tokens: int = 8_192
     history_search_limit: int = 5
@@ -57,6 +80,12 @@ class AgentConfig:
             raise ValueError("retry_base_delay_s must be >= 0")
         if self.repeated_tool_call_limit < 1:
             raise ValueError("repeated_tool_call_limit must be >= 1")
+        if self.no_progress_window < self.repeated_tool_call_limit + 1:
+            raise ValueError(
+                "no_progress_window must be greater than repeated_tool_call_limit"
+            )
+        if self.max_consecutive_tool_errors < 1:
+            raise ValueError("max_consecutive_tool_errors must be >= 1")
         ContextConfig(
             max_tokens=self.max_context_tokens,
             summary_max_tokens=self.context_summary_tokens,
@@ -71,6 +100,55 @@ class AgentResult:
     termination_reason: str
     conversation: ConversationState
     session_id: str | None = None
+    status: AgentStatus = AgentStatus.COMPLETED
+
+
+class _NoProgressTracker:
+    """Detect exact action cycles and sustained tool failures in a short window."""
+
+    def __init__(self, config: AgentConfig) -> None:
+        self._repeat_limit = config.repeated_tool_call_limit
+        self._actions: deque[str] = deque(maxlen=config.no_progress_window)
+        self._failures: deque[str] = deque(maxlen=config.no_progress_window)
+        self._consecutive_errors = 0
+        self._max_consecutive_errors = config.max_consecutive_tool_errors
+
+    def check_action(self, call: ToolCall) -> str | None:
+        fingerprint = Agent._tool_fingerprint(call)
+        candidate = [*self._actions, fingerprint]
+        repetitions = self._repeat_limit + 1
+        for width in range(1, len(candidate) // repetitions + 1):
+            pattern = candidate[-width:]
+            if candidate[-width * repetitions :] == pattern * repetitions:
+                return (
+                    f"tool action pattern of length {width} repeated more than "
+                    f"{self._repeat_limit} times"
+                )
+        self._actions.append(fingerprint)
+        return None
+
+    def record_result(self, call: ToolCall, result: ToolExecutionResult) -> str | None:
+        if result.ok:
+            self._consecutive_errors = 0
+            return None
+
+        self._consecutive_errors += 1
+        normalized_error = " ".join((result.error or "unknown tool error").split())
+        failure = hashlib.sha256(
+            f"{call.name}\0{normalized_error}".encode("utf-8")
+        ).hexdigest()
+        self._failures.append(failure)
+        if self._consecutive_errors >= self._max_consecutive_errors:
+            return (
+                f"{self._consecutive_errors} consecutive tool calls failed; "
+                f"last tool was {call.name!r}"
+            )
+        if sum(item == failure for item in self._failures) > self._repeat_limit:
+            return (
+                f"tool {call.name!r} produced the same error more than "
+                f"{self._repeat_limit} times in the recent window"
+            )
+        return None
 
 
 class Agent:
@@ -139,10 +217,70 @@ class Agent:
         state.add_user(user_input)
         self._events.emit("user_message", {"content": user_input})
 
-        last_fingerprint: str | None = None
-        consecutive_repeats = 0
+        progress = _NoProgressTracker(self._config)
         verification_required = False
+        finalization_reason: str | None = None
         for step in range(1, self._config.max_steps + 1):
+            finalization_step = (
+                finalization_reason is not None or step == self._config.max_steps
+            )
+            if finalization_step:
+                reason = finalization_reason or "maximum model steps reached"
+                status = AgentStatus.PARTIAL
+                verification_state = "no workspace changes require verification"
+                if verification_required:
+                    result = self._run_in_memory_verification(state, step=step)
+                    if self._verification_passed(result):
+                        verification_required = False
+                        verification_state = "project verification passed"
+                    else:
+                        verification_state, blocked = self._verification_failure_state(
+                            result
+                        )
+                        if blocked:
+                            status = AgentStatus.BLOCKED
+
+                model_started = time.monotonic()
+                response = self._request_model(
+                    self._finalization_messages(
+                        state.messages,
+                        reason=reason,
+                        verification_state=verification_state,
+                    ),
+                    tools_enabled=False,
+                )
+                model_duration_ms = round((time.monotonic() - model_started) * 1000)
+                self._validate_response(response)
+                if response.tool_calls:
+                    raise ModelProtocolError(
+                        "model returned tool calls during the text-only finalization step"
+                    )
+                state.add_assistant(response.assistant_message)
+                self._emit_model_response(
+                    response,
+                    step=step,
+                    duration_ms=model_duration_ms,
+                )
+                termination_reason = (
+                    "no_progress" if finalization_reason is not None else "max_steps"
+                )
+                self._events.emit(
+                    "agent_terminated",
+                    {
+                        "step": step,
+                        "reason": termination_reason,
+                        "status": status.value,
+                        "verification_state": verification_state,
+                    },
+                )
+                return AgentResult(
+                    text=response.text or "",
+                    steps=step,
+                    termination_reason=termination_reason,
+                    conversation=state,
+                    status=status,
+                )
+
             model_started = time.monotonic()
             response = self._request_model(state.messages)
             model_duration_ms = round((time.monotonic() - model_started) * 1000)
@@ -177,35 +315,32 @@ class Agent:
                 text = response.text or ""
                 self._events.emit(
                     "agent_terminated",
-                    {"step": step, "reason": "final_response"},
+                    {
+                        "step": step,
+                        "reason": "final_response",
+                        "status": AgentStatus.COMPLETED.value,
+                    },
                 )
                 return AgentResult(
                     text=text,
                     steps=step,
                     termination_reason="final_response",
                     conversation=state,
+                    status=AgentStatus.COMPLETED,
                 )
 
-            for call in response.tool_calls:
-                fingerprint = self._tool_fingerprint(call)
-                if fingerprint == last_fingerprint:
-                    consecutive_repeats += 1
-                else:
-                    last_fingerprint = fingerprint
-                    consecutive_repeats = 1
-                if consecutive_repeats > self._config.repeated_tool_call_limit:
-                    self._events.emit(
-                        "agent_terminated",
-                        {
-                            "step": step,
-                            "reason": "repeated_tool_call",
-                            "tool": call.name,
-                        },
+            for index, call in enumerate(response.tool_calls):
+                no_progress = progress.check_action(call)
+                if no_progress is not None:
+                    self._record_skipped_in_memory_calls(
+                        state,
+                        response.tool_calls[index:],
+                        step=step,
+                        reason=no_progress,
                     )
-                    raise LoopDetected(
-                        f"tool {call.name!r} repeated with identical arguments more than "
-                        f"{self._config.repeated_tool_call_limit} times"
-                    )
+                    finalization_reason = no_progress
+                    self._emit_no_progress(step=step, call=call, reason=no_progress)
+                    break
 
                 tool_started = time.monotonic()
                 result = self._tools.execute(call)
@@ -228,14 +363,19 @@ class Agent:
                     call,
                     result,
                 )
+                no_progress = progress.record_result(call, result)
+                if no_progress is not None:
+                    self._record_skipped_in_memory_calls(
+                        state,
+                        response.tool_calls[index + 1 :],
+                        step=step,
+                        reason=no_progress,
+                    )
+                    finalization_reason = no_progress
+                    self._emit_no_progress(step=step, call=call, reason=no_progress)
+                    break
 
-        self._events.emit(
-            "agent_terminated",
-            {"step": self._config.max_steps, "reason": "max_steps"},
-        )
-        raise MaxStepsExceeded(
-            f"agent exceeded maximum of {self._config.max_steps} model steps"
-        )
+        raise AssertionError("the final model step must return a text-only handoff")
 
     def _run_persisted(
         self, user_input: str, *, session_id: str | None
@@ -276,9 +416,80 @@ class Agent:
                 {"session_id": session_id, "content": user_input},
             )
 
-            last_fingerprint: str | None = None
-            consecutive_repeats = 0
+            progress = _NoProgressTracker(self._config)
+            finalization_reason: str | None = None
             for step in range(1, self._config.max_steps + 1):
+                finalization_step = (
+                    finalization_reason is not None or step == self._config.max_steps
+                )
+                if finalization_step:
+                    reason = finalization_reason or "maximum model steps reached"
+                    status = AgentStatus.PARTIAL
+                    verification_state = "no workspace changes require verification"
+                    if verification_required:
+                        result = self._run_persisted_verification(
+                            session_id,
+                            step=step,
+                        )
+                        if self._verification_passed(result):
+                            verification_required = False
+                            verification_state = "project verification passed"
+                        else:
+                            verification_state, blocked = (
+                                self._verification_failure_state(result)
+                            )
+                            if blocked:
+                                status = AgentStatus.BLOCKED
+
+                    model_started = time.monotonic()
+                    response = self._request_model(
+                        self._finalization_messages(
+                            self._context.build(session_id),
+                            reason=reason,
+                            verification_state=verification_state,
+                        ),
+                        tools_enabled=False,
+                    )
+                    model_duration_ms = round(
+                        (time.monotonic() - model_started) * 1000
+                    )
+                    self._validate_response(response)
+                    if response.tool_calls:
+                        raise ModelProtocolError(
+                            "model returned tool calls during the text-only finalization step"
+                        )
+                    self._store.append_assistant(session_id, response)
+                    self._emit_model_response(
+                        response,
+                        step=step,
+                        duration_ms=model_duration_ms,
+                        session_id=session_id,
+                    )
+                    termination_reason = (
+                        "no_progress" if finalization_reason is not None else "max_steps"
+                    )
+                    self._store.set_session_status(session_id, status.value)
+                    self._events.emit(
+                        "agent_terminated",
+                        {
+                            "session_id": session_id,
+                            "step": step,
+                            "reason": termination_reason,
+                            "status": status.value,
+                            "verification_state": verification_state,
+                        },
+                    )
+                    return AgentResult(
+                        text=response.text or "",
+                        steps=step,
+                        termination_reason=termination_reason,
+                        conversation=ConversationState.from_messages(
+                            self._context.build(session_id)
+                        ),
+                        session_id=session_id,
+                        status=status,
+                    )
+
                 model_started = time.monotonic()
                 response = self._request_model(self._context.build(session_id))
                 model_duration_ms = round((time.monotonic() - model_started) * 1000)
@@ -330,6 +541,7 @@ class Agent:
                             "session_id": session_id,
                             "step": step,
                             "reason": "final_response",
+                            "status": AgentStatus.COMPLETED.value,
                         },
                     )
                     return AgentResult(
@@ -340,29 +552,26 @@ class Agent:
                             self._context.build(session_id)
                         ),
                         session_id=session_id,
+                        status=AgentStatus.COMPLETED,
                     )
 
-                for call in response.tool_calls:
-                    fingerprint = self._tool_fingerprint(call)
-                    if fingerprint == last_fingerprint:
-                        consecutive_repeats += 1
-                    else:
-                        last_fingerprint = fingerprint
-                        consecutive_repeats = 1
-                    if consecutive_repeats > self._config.repeated_tool_call_limit:
-                        self._events.emit(
-                            "agent_terminated",
-                            {
-                                "session_id": session_id,
-                                "step": step,
-                                "reason": "repeated_tool_call",
-                                "tool": call.name,
-                            },
+                for index, call in enumerate(response.tool_calls):
+                    no_progress = progress.check_action(call)
+                    if no_progress is not None:
+                        self._record_skipped_persisted_calls(
+                            session_id,
+                            response.tool_calls[index:],
+                            step=step,
+                            reason=no_progress,
                         )
-                        raise LoopDetected(
-                            f"tool {call.name!r} repeated with identical arguments more than "
-                            f"{self._config.repeated_tool_call_limit} times"
+                        finalization_reason = no_progress
+                        self._emit_no_progress(
+                            step=step,
+                            call=call,
+                            reason=no_progress,
+                            session_id=session_id,
                         )
+                        break
 
                     claim = self._store.claim_tool_call(session_id, call.id)
                     if claim.execute:
@@ -398,21 +607,51 @@ class Agent:
                         call,
                         result,
                     )
+                    no_progress = progress.record_result(call, result)
+                    if no_progress is not None:
+                        self._record_skipped_persisted_calls(
+                            session_id,
+                            response.tool_calls[index + 1 :],
+                            step=step,
+                            reason=no_progress,
+                        )
+                        finalization_reason = no_progress
+                        self._emit_no_progress(
+                            step=step,
+                            call=call,
+                            reason=no_progress,
+                            session_id=session_id,
+                        )
+                        break
 
-            self._events.emit(
-                "agent_terminated",
-                {
-                    "session_id": session_id,
-                    "step": self._config.max_steps,
-                    "reason": "max_steps",
-                },
-            )
-            raise MaxStepsExceeded(
-                f"agent exceeded maximum of {self._config.max_steps} model steps"
-            )
+            raise AssertionError("the final model step must return a text-only handoff")
+        except VerificationRequiredError as exc:
+            try:
+                self._store.set_session_status(
+                    session_id,
+                    AgentStatus.BLOCKED.value,
+                    error=str(exc),
+                )
+            except Exception:
+                pass
+            raise
+        except KeyboardInterrupt:
+            try:
+                self._store.set_session_status(
+                    session_id,
+                    AgentStatus.INTERRUPTED.value,
+                    error="interrupted by user",
+                )
+            except Exception:
+                pass
+            raise
         except Exception as exc:
             try:
-                self._store.set_session_status(session_id, "error", error=str(exc))
+                self._store.set_session_status(
+                    session_id,
+                    AgentStatus.FAILED.value,
+                    error=str(exc),
+                )
             except Exception:
                 pass
             raise
@@ -468,6 +707,105 @@ class Agent:
         if automatic:
             payload["automatic"] = True
         self._events.emit("tool_result", payload)
+
+    @staticmethod
+    def _finalization_messages(
+        messages: list[Message],
+        *,
+        reason: str,
+        verification_state: str,
+    ) -> list[Message]:
+        prompt = FINALIZATION_PROMPT.format(
+            reason=reason,
+            verification_state=verification_state,
+        )
+        final_messages = [dict(message) for message in messages]
+        if final_messages and final_messages[0].get("role") == "system":
+            existing = str(final_messages[0].get("content") or "").rstrip()
+            final_messages[0]["content"] = (
+                f"{existing}\n\n{prompt}" if existing else prompt
+            )
+        else:
+            final_messages.insert(0, {"role": "system", "content": prompt})
+        return final_messages
+
+    @staticmethod
+    def _verification_failure_state(
+        result: ToolExecutionResult,
+    ) -> tuple[str, bool]:
+        output = result.output if isinstance(result.output, dict) else {}
+        unavailable = not result.ok or output.get("skipped") is True
+        reason = result.error or output.get("skip_reason")
+        if unavailable:
+            return (
+                f"verification is blocked or unavailable: {reason or 'unknown reason'}",
+                True,
+            )
+        return ("project verification ran but checks failed", False)
+
+    def _emit_no_progress(
+        self,
+        *,
+        step: int,
+        call: ToolCall,
+        reason: str,
+        session_id: str | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "step": step,
+            "tool": call.name,
+            "reason": reason,
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+        self._events.emit("no_progress_detected", payload)
+
+    def _record_skipped_in_memory_calls(
+        self,
+        state: ConversationState,
+        calls: Sequence[ToolCall],
+        *,
+        step: int,
+        reason: str,
+    ) -> None:
+        for call in calls:
+            result = ToolExecutionResult(
+                tool_call_id=call.id,
+                name=call.name,
+                ok=False,
+                error=f"not executed because no progress was detected: {reason}",
+            )
+            state.add_tool(result.to_message())
+            self._emit_tool_result(result, step=step, duration_ms=0)
+
+    def _record_skipped_persisted_calls(
+        self,
+        session_id: str,
+        calls: Sequence[ToolCall],
+        *,
+        step: int,
+        reason: str,
+    ) -> None:
+        for call in calls:
+            claim = self._store.claim_tool_call(session_id, call.id)
+            if claim.execute:
+                result = ToolExecutionResult(
+                    tool_call_id=call.id,
+                    name=call.name,
+                    ok=False,
+                    error=f"not executed because no progress was detected: {reason}",
+                )
+                self._store.finish_tool_call(session_id, result)
+            elif claim.result is not None:
+                result = claim.result
+            else:
+                raise RuntimeError(f"tool call {call.id!r} is already {claim.status}")
+            self._emit_tool_result(
+                result,
+                step=step,
+                duration_ms=0,
+                session_id=session_id,
+            )
 
     @staticmethod
     def _automatic_verification_response() -> ModelResponse:
@@ -607,14 +945,19 @@ class Agent:
                     required = True
         return required
 
-    def _request_model(self, messages: list[Message]) -> ModelResponse:
+    def _request_model(
+        self,
+        messages: list[Message],
+        *,
+        tools_enabled: bool = True,
+    ) -> ModelResponse:
         last_error: ModelRequestError | None = None
         attempts = self._config.max_model_retries + 1
         for attempt in range(1, attempts + 1):
             try:
                 return self._model.generate(
                     messages,
-                    self._tools.schemas(),
+                    self._tools.schemas() if tools_enabled else [],
                     timeout_s=self._config.model_timeout_s,
                 )
             except ModelRequestError as exc:

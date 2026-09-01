@@ -329,9 +329,19 @@ class SqliteConversationStoreTests(unittest.TestCase):
                 """
             ).fetchone()
 
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
         self.assertIsNotNone(summary_table)
         self.assertIsNotNone(fts_table)
+
+    def test_session_records_explicit_terminal_statuses(self) -> None:
+        store, session_id = self.create_store_and_session()
+
+        for status in ("partial", "blocked", "interrupted", "failed"):
+            with self.subTest(status=status):
+                store.set_session_status(session_id, status, error=f"{status} detail")
+                record = store.get_session(session_id)
+                self.assertEqual(record.status, status)
+                self.assertEqual(record.error, f"{status} detail")
 
     def test_existing_version_one_database_is_upgraded(self) -> None:
         self.database.parent.mkdir(parents=True)
@@ -384,7 +394,7 @@ class SqliteConversationStoreTests(unittest.TestCase):
                     "SELECT version FROM schema_migration ORDER BY version"
                 )
             ]
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
         matches = upgraded.search_history(
             "LegacyBackfillMarker", session_id="legacy-session"
         )

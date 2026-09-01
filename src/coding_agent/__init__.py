@@ -1,6 +1,6 @@
 """Minimal, framework-free coding agent."""
 
-from .agent import Agent, AgentConfig, AgentResult
+from .agent import Agent, AgentConfig, AgentResult, AgentStatus
 from .conversation import ConversationState
 from .context import ContextBuilder, ContextConfig
 from .events import CompositeEventSink
@@ -32,6 +32,8 @@ __all__ = [
     "Agent",
     "AgentConfig",
     "AgentResult",
+    "AgentStatus",
+    "ApprovalDecision",
     "AllowAllApprovalPolicy",
     "ApprovalPolicy",
     "CompositeEventSink",
