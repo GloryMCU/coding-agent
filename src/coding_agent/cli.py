@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "Expose restricted web_search/fetch_webpage tools to the agent "
-            "(default: enabled; search requires BRAVE_SEARCH_API_KEY)"
+            "(default: enabled; EXA_API_KEY is optional)"
         ),
     )
     parser.add_argument(
@@ -196,7 +196,7 @@ def main() -> int:
         raise SystemExit(f"sandbox unavailable: {exc}") from exc
     command_runner = ControlledCommandRunner(workspace, sandbox=sandbox)
     web_client = (
-        WebAccessClient(brave_api_key=os.getenv("BRAVE_SEARCH_API_KEY"))
+        WebAccessClient(exa_api_key=os.getenv("EXA_API_KEY"))
         if args.web_access
         else None
     )

@@ -18,16 +18,20 @@ from coding_agent.web_tools import (
 class FakeTransport:
     def __init__(self, *responses: HttpResponse) -> None:
         self.responses = list(responses)
-        self.requests: list[tuple[ResolvedHttpsTarget, Mapping[str, str]]] = []
+        self.requests: list[
+            tuple[ResolvedHttpsTarget, str, Mapping[str, str], bytes | None]
+        ] = []
 
     def __call__(
         self,
         target: ResolvedHttpsTarget,
+        method: str,
         headers: Mapping[str, str],
+        body: bytes | None,
         timeout_s: float,
         max_bytes: int,
     ) -> HttpResponse:
-        self.requests.append((target, dict(headers)))
+        self.requests.append((target, method, dict(headers), body))
         if not self.responses:
             raise AssertionError("unexpected HTTP request")
         return self.responses.pop(0)
@@ -42,52 +46,87 @@ def fake_resolver(hostname: str, port: int) -> list[str]:
 
 
 class WebSearchTests(unittest.TestCase):
-    def test_search_uses_fixed_endpoint_and_returns_bounded_projection(self) -> None:
+    def test_search_calls_exa_mcp_and_returns_text_content(self) -> None:
         body = json.dumps(
             {
-                "web": {
-                    "results": [
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [
                         {
-                            "title": "<b>Official</b> docs",
-                            "url": "https://docs.example/guide",
-                            "description": "Read <strong>the guide</strong>.",
-                            "age": "2 hours ago",
-                            "irrelevant_secret_field": "must not escape",
-                        },
-                        {"title": "unsafe", "url": "javascript:alert(1)"},
+                            "type": "text",
+                            "text": "Official docs: https://docs.example/guide",
+                        }
                     ]
-                }
+                },
             }
         ).encode()
         transport = FakeTransport(
             HttpResponse(200, {"content-type": "application/json"}, body)
         )
         client = WebAccessClient(
-            brave_api_key="brave-test-secret",
+            exa_api_key="exa test/secret",
             resolver=fake_resolver,
             transport=transport,
         )
 
-        result = client.search("current Python release", count=3, freshness="week")
+        result = client.search(
+            "current Python release",
+            count=3,
+            search_type="deep",
+            livecrawl="preferred",
+            context_max_characters=12_000,
+        )
 
-        self.assertEqual(result["result_count"], 1)
-        self.assertEqual(result["results"][0]["title"], "Official docs")
-        self.assertEqual(result["results"][0]["description"], "Read the guide.")
-        target, headers = transport.requests[0]
-        self.assertEqual(target.hostname, "api.search.brave.com")
-        self.assertIn("q=current+Python+release", target.request_target)
-        self.assertIn("freshness=pw", target.request_target)
-        self.assertEqual(headers["X-Subscription-Token"], "brave-test-secret")
-        self.assertNotIn("brave-test-secret", json.dumps(result))
-        self.assertNotIn("irrelevant_secret_field", json.dumps(result))
+        self.assertEqual(
+            result["content"], "Official docs: https://docs.example/guide"
+        )
+        self.assertEqual(result["provider"], "Exa MCP")
+        target, method, headers, request_body = transport.requests[0]
+        self.assertEqual(target.hostname, "mcp.exa.ai")
+        self.assertEqual(target.request_target, "/mcp?exaApiKey=exa+test%2Fsecret")
+        self.assertEqual(method, "POST")
+        self.assertEqual(headers["Content-Type"], "application/json")
+        payload = json.loads((request_body or b"").decode())
+        self.assertEqual(payload["method"], "tools/call")
+        self.assertEqual(payload["params"]["name"], "web_search_exa")
+        self.assertEqual(
+            payload["params"]["arguments"],
+            {
+                "query": "current Python release",
+                "type": "deep",
+                "numResults": 3,
+                "livecrawl": "preferred",
+                "contextMaxCharacters": 12_000,
+            },
+        )
+        self.assertNotIn("exa test/secret", json.dumps(result))
 
-    def test_search_requires_key_and_refuses_authenticated_redirects(self) -> None:
-        missing = WebAccessClient(resolver=fake_resolver, transport=FakeTransport())
-        with self.assertRaisesRegex(Exception, "BRAVE_SEARCH_API_KEY"):
-            missing.search("test")
+    def test_search_allows_public_mcp_and_parses_sse(self) -> None:
+        event = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": "SSE result"}]},
+        }
+        transport = FakeTransport(
+            HttpResponse(
+                200,
+                {"content-type": "text/event-stream"},
+                f"event: message\ndata: {json.dumps(event)}\n\n".encode(),
+            )
+        )
+        client = WebAccessClient(resolver=fake_resolver, transport=transport)
+
+        result = client.search("test")
+
+        self.assertEqual(result["content"], "SSE result")
+        target, _, _, _ = transport.requests[0]
+        self.assertEqual(target.request_target, "/mcp")
+
+    def test_search_refuses_redirects_and_surfaces_mcp_errors(self) -> None:
 
         redirected = WebAccessClient(
-            brave_api_key="secret",
+            exa_api_key="secret",
             resolver=fake_resolver,
             transport=FakeTransport(
                 HttpResponse(302, {"location": "https://other.example/"}, b"")
@@ -95,6 +134,30 @@ class WebSearchTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(Exception, "redirects are not allowed"):
             redirected.search("test")
+
+        failed = WebAccessClient(
+            resolver=fake_resolver,
+            transport=FakeTransport(
+                HttpResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {
+                                "isError": True,
+                                "content": [
+                                    {"type": "text", "text": "rate limit exceeded"}
+                                ],
+                            },
+                        }
+                    ).encode(),
+                )
+            ),
+        )
+        with self.assertRaisesRegex(Exception, "rate limit exceeded"):
+            failed.search("test")
 
 
 class FetchWebpageTests(unittest.TestCase):
@@ -175,11 +238,19 @@ class WebToolRegistryTests(unittest.TestCase):
             HttpResponse(
                 200,
                 {"content-type": "application/json"},
-                json.dumps({"web": {"results": []}}).encode(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{"type": "text", "text": "No results"}]
+                        },
+                    }
+                ).encode(),
             )
         )
         client = WebAccessClient(
-            brave_api_key="test-key",
+            exa_api_key="test-key",
             resolver=fake_resolver,
             transport=transport,
         )
@@ -198,7 +269,7 @@ class WebToolRegistryTests(unittest.TestCase):
             )
 
         self.assertTrue(result.ok, result.error)
-        self.assertEqual(result.output["provider"], "Brave Search")
+        self.assertEqual(result.output["provider"], "Exa MCP")
 
     def test_registry_schema_rejects_oversized_url_before_network(self) -> None:
         client = WebAccessClient(resolver=fake_resolver, transport=FakeTransport())

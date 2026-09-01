@@ -193,6 +193,37 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("private-details.py", rendered)
             self.assertNotIn("hidden", rendered)
 
+    async def test_copies_latest_raw_agent_response(self) -> None:
+        app = self.make_app()
+        answer = "Use this code:\n\n```python\nprint('hello')\n```"
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.post_agent_event(
+                "model_response",
+                {"tool_calls": [], "text": answer},
+            )
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+
+            self.assertEqual(app.last_assistant_text, answer)
+            self.assertEqual(app._clipboard, answer)
+
+    async def test_copy_local_command_and_new_session_reset(self) -> None:
+        app = self.make_app()
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.post_agent_event(
+                "model_response",
+                {"tool_calls": [], "text": "Latest answer"},
+            )
+            app.submit_prompt("/copy")
+            await pilot.pause()
+            self.assertEqual(app._clipboard, "Latest answer")
+
+            app.submit_prompt("/new")
+            await pilot.pause()
+            self.assertIsNone(app.last_assistant_text)
+
     async def test_provisional_final_is_hidden_while_verification_runs(self) -> None:
         app = self.make_app()
 

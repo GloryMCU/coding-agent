@@ -16,7 +16,8 @@ from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 from .errors import WebAccessError
 
 
-_BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+_EXA_MCP_ENDPOINT = "https://mcp.exa.ai/mcp"
+_EXA_MCP_TOOL = "web_search_exa"
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _ALLOWED_PAGE_TYPES = frozenset(
     {"text/html", "application/xhtml+xml", "text/plain", "application/json"}
@@ -50,7 +51,8 @@ _BLOCK_TAGS = frozenset(
         "ul",
     }
 )
-_FRESHNESS = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}
+_EXA_SEARCH_TYPES = frozenset({"auto", "fast", "deep"})
+_EXA_LIVECRAWL_MODES = frozenset({"fallback", "preferred"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +76,8 @@ class HttpResponse:
 
 Resolver = Callable[[str, int], list[str]]
 Transport = Callable[
-    [ResolvedHttpsTarget, Mapping[str, str], float, int], HttpResponse
+    [ResolvedHttpsTarget, str, Mapping[str, str], bytes | None, float, int],
+    HttpResponse,
 ]
 
 
@@ -84,7 +87,7 @@ class WebAccessClient:
     def __init__(
         self,
         *,
-        brave_api_key: str | None = None,
+        exa_api_key: str | None = None,
         timeout_s: float = 15.0,
         max_response_bytes: int = 512 * 1024,
         max_redirects: int = 3,
@@ -97,10 +100,10 @@ class WebAccessClient:
             raise ValueError("max_response_bytes must be at least 1024")
         if not 0 <= max_redirects <= 10:
             raise ValueError("max_redirects must be between 0 and 10")
-        key = (brave_api_key or "").strip()
+        key = (exa_api_key or "").strip()
         if "\r" in key or "\n" in key:
-            raise ValueError("Brave Search API key contains invalid characters")
-        self._brave_api_key = key or None
+            raise ValueError("Exa API key contains invalid characters")
+        self._exa_api_key = key or None
         self._timeout_s = timeout_s
         self._max_response_bytes = max_response_bytes
         self._max_redirects = max_redirects
@@ -112,77 +115,76 @@ class WebAccessClient:
         query: str,
         *,
         count: int = 5,
-        freshness: str | None = None,
+        search_type: str = "auto",
+        livecrawl: str = "fallback",
+        context_max_characters: int | None = 10_000,
     ) -> dict[str, object]:
-        """Return a bounded projection of Brave Search web results."""
+        """Search the public web through Exa's remote MCP server."""
 
         normalized_query = " ".join(query.split())
         if not normalized_query:
             raise WebAccessError("search query must not be empty")
-        if len(normalized_query) > 400 or len(normalized_query.split()) > 50:
-            raise WebAccessError("search query exceeds Brave's 400 character/50 word limit")
+        if len(normalized_query) > 2_000:
+            raise WebAccessError("search query exceeds 2000 characters")
         if not 1 <= count <= 10:
             raise WebAccessError("search count must be between 1 and 10")
-        if freshness is not None and freshness not in _FRESHNESS:
-            raise WebAccessError("freshness must be day, week, month, or year")
-        if self._brave_api_key is None:
+        if search_type not in _EXA_SEARCH_TYPES:
+            raise WebAccessError("search_type must be auto, fast, or deep")
+        if livecrawl not in _EXA_LIVECRAWL_MODES:
+            raise WebAccessError("livecrawl must be fallback or preferred")
+        if context_max_characters is not None and not (
+            1_000 <= context_max_characters <= 50_000
+        ):
             raise WebAccessError(
-                "web_search requires the BRAVE_SEARCH_API_KEY environment variable"
+                "context_max_characters must be between 1000 and 50000"
             )
 
-        parameters: dict[str, str | int] = {
-            "q": normalized_query,
-            "count": count,
-            "safesearch": "moderate",
-            "text_decorations": "false",
-            "result_filter": "web",
+        arguments: dict[str, object] = {
+            "query": normalized_query,
+            "type": search_type,
+            "numResults": count,
+            "livecrawl": livecrawl,
         }
-        if freshness is not None:
-            parameters["freshness"] = _FRESHNESS[freshness]
-        url = f"{_BRAVE_SEARCH_ENDPOINT}?{urlencode(parameters)}"
+        if context_max_characters is not None:
+            arguments["contextMaxCharacters"] = context_max_characters
+        request_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": _EXA_MCP_TOOL,
+                    "arguments": arguments,
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        url = _EXA_MCP_ENDPOINT
+        if self._exa_api_key is not None:
+            url = f"{url}?{urlencode({'exaApiKey': self._exa_api_key})}"
         response, _ = self._request(
             url,
+            method="POST",
             headers={
-                "Accept": "application/json",
-                "X-Subscription-Token": self._brave_api_key,
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
             },
+            body=request_body,
             follow_redirects=False,
         )
         if response.status != 200:
-            raise WebAccessError(f"Brave Search returned HTTP {response.status}")
+            raise WebAccessError(f"Exa MCP returned HTTP {response.status}")
         if response.truncated:
-            raise WebAccessError("Brave Search response exceeded the size limit")
+            raise WebAccessError("Exa MCP response exceeded the size limit")
         try:
-            payload = json.loads(response.body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise WebAccessError("Brave Search returned invalid JSON") from exc
-        if not isinstance(payload, dict):
-            raise WebAccessError("Brave Search returned an unexpected response")
-
-        web = payload.get("web")
-        raw_results = web.get("results", []) if isinstance(web, dict) else []
-        results: list[dict[str, str]] = []
-        if isinstance(raw_results, list):
-            for item in raw_results[:count]:
-                if not isinstance(item, dict):
-                    continue
-                result_url = _bounded_text(item.get("url"), 2048)
-                if urlsplit(result_url).scheme.casefold() not in {"http", "https"}:
-                    continue
-                result = {
-                    "title": _clean_fragment(item.get("title"), 500),
-                    "url": result_url,
-                    "description": _clean_fragment(item.get("description"), 2000),
-                }
-                age = _bounded_text(item.get("age"), 100)
-                if age:
-                    result["age"] = age
-                results.append(result)
+            result_text = _parse_exa_mcp_response(response.body.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise WebAccessError("Exa MCP returned invalid UTF-8") from exc
         return {
             "query": normalized_query,
-            "result_count": len(results),
-            "results": results,
-            "provider": "Brave Search",
+            "content": result_text,
+            "provider": "Exa MCP",
             "untrusted": True,
         }
 
@@ -193,7 +195,9 @@ class WebAccessClient:
             raise WebAccessError("max_chars must be between 1000 and 100000")
         response, final_url = self._request(
             url,
+            method="GET",
             headers={"Accept": "text/html,application/xhtml+xml,text/plain,application/json"},
+            body=None,
             follow_redirects=True,
         )
         if not 200 <= response.status < 300:
@@ -241,7 +245,9 @@ class WebAccessClient:
         self,
         url: str,
         *,
+        method: str,
         headers: Mapping[str, str],
+        body: bytes | None,
         follow_redirects: bool,
     ) -> tuple[HttpResponse, str]:
         current_url = url
@@ -256,7 +262,9 @@ class WebAccessClient:
             try:
                 response = self._transport(
                     target,
+                    method,
                     request_headers,
+                    body,
                     self._timeout_s,
                     self._max_response_bytes,
                 )
@@ -316,13 +324,20 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 def _https_transport(
     target: ResolvedHttpsTarget,
+    method: str,
     headers: Mapping[str, str],
+    body: bytes | None,
     timeout_s: float,
     max_bytes: int,
 ) -> HttpResponse:
     connection = _PinnedHTTPSConnection(target, timeout=timeout_s)
     try:
-        connection.request("GET", target.request_target, headers=dict(headers))
+        connection.request(
+            method,
+            target.request_target,
+            body=body,
+            headers=dict(headers),
+        )
         response = connection.getresponse()
         body = response.read(max_bytes + 1)
         truncated = len(body) > max_bytes
@@ -336,6 +351,54 @@ def _https_transport(
         )
     finally:
         connection.close()
+
+
+def _parse_exa_mcp_response(body: str) -> str:
+    candidates = [body.strip()]
+    candidates.extend(
+        line.partition(":")[2].lstrip()
+        for line in body.splitlines()
+        if line.startswith("data:")
+    )
+    provider_error: str | None = None
+    for candidate in candidates:
+        if not candidate or not candidate.startswith("{"):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = _bounded_text(error.get("message"), 500)
+            provider_error = message or "unknown MCP error"
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            continue
+        content = result.get("content")
+        if not isinstance(content, list):
+            continue
+        text_parts = [
+            item["text"]
+            for item in content
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+            and item["text"].strip()
+        ]
+        if result.get("isError") is True:
+            rendered = "\n".join(text_parts).strip()
+            raise WebAccessError(
+                f"Exa MCP tool failed: {_bounded_text(rendered, 500) or 'unknown error'}"
+            )
+        if text_parts:
+            return "\n".join(text_parts).strip()
+    if provider_error is not None:
+        raise WebAccessError(f"Exa MCP error: {provider_error}")
+    raise WebAccessError("Exa MCP returned an unexpected response")
 
 
 def _resolve_addresses(hostname: str, port: int) -> list[str]:

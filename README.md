@@ -85,6 +85,17 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 ```
 
+`web_search` 通过 Exa 的远程 MCP 服务查询公开网页。Exa 公共 MCP 端点可在不配置
+Key 时使用；需要独立配额或更稳定的生产使用时，可选设置：
+
+```powershell
+$env:EXA_API_KEY = "your-exa-api-key"
+```
+
+搜索请求固定发送到 `https://mcp.exa.ai/mcp`，返回内容会标记为不可信数据；
+`fetch_webpage` 继续使用带 DNS/IP 复查和响应大小限制的受限 HTTPS 读取。
+使用 `--no-web-access` 可以同时禁用这两个工具。
+
 CLI 默认以 fail-closed 方式要求本地 OCI 容器运行时和一个明确指定的可信镜像。
 仓库提供仅含 Python 的最小示例；构建不会由 Agent 自动执行，也不会在运行任务时
 自动拉取镜像：
@@ -171,9 +182,12 @@ Footer：快捷键
 快捷键和本地命令：
 
 - `Ctrl+Enter` 或 `Ctrl+S`：发送任务；
+- `Ctrl+Y`：复制最近一条 Agent 回答的原始 Markdown（代码块保持原样）；
+- 鼠标选中会话文本后按 `Ctrl+C`：复制选中的局部文本；
 - `Ctrl+L`：清空当前界面，不删除 SQLite 历史；
 - `Ctrl+Q`：退出；
 - `/new`：开始一个新的持久化会话；
+- `/copy`：复制最近一条 Agent 回答；
 - `/clear`、`/help`、`/exit`：清屏、帮助和退出。
 
 同步的 `Agent.run` 在 Textual 线程 Worker 中执行，模型和工具事件通过
@@ -360,6 +374,7 @@ python -m unittest discover -s tests -v
 - 审计日志凭据脱敏及 reasoning 移除
 - 仓库验证策略检测与测试执行
 - 工具参数 Schema 校验
+- Exa MCP JSON/SSE 搜索响应、可选 API Key 和搜索错误处理
 - SQLite 重启后上下文恢复
 - 上下文预算、完整轮次裁剪和结构化摘要持久化
 - 压缩历史不提升为 system 权限

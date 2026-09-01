@@ -56,6 +56,7 @@ class CodingAgentApp(App[None]):
 
     BINDINGS = [
         Binding("ctrl+enter", "submit_prompt", "Send", priority=True),
+        Binding("ctrl+y", "copy_last_response", "Copy answer", priority=True),
         Binding("ctrl+l", "clear_conversation", "Clear", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
@@ -144,6 +145,7 @@ class CodingAgentApp(App[None]):
         self.tui_approval: TuiApprovalPolicy | None = None
         self.busy = False
         self.completed_tools = 0
+        self.last_assistant_text: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -252,10 +254,11 @@ class CodingAgentApp(App[None]):
                 return
             text = payload.get("text")
             if text:
+                self.last_assistant_text = str(text)
                 self._conversation().write(
                     Text.assemble(("◆ ", "bold green"), ("Agent", "bold green"))
                 )
-                self._conversation().write(Markdown(str(text)))
+                self._conversation().write(Markdown(self.last_assistant_text))
                 self._set_activity("Finishing…")
             return
 
@@ -317,6 +320,13 @@ class CodingAgentApp(App[None]):
         self._conversation().clear()
         self._conversation().write(Text("Conversation view cleared.", style="dim"))
 
+    def action_copy_last_response(self) -> None:
+        if self.last_assistant_text is None:
+            self.notify("No agent response is available to copy.", severity="warning")
+            return
+        self.copy_to_clipboard(self.last_assistant_text)
+        self.notify("Copied the latest agent response.")
+
     def _handle_local_command(self, prompt: str) -> bool:
         command = prompt.casefold()
         if command in {"/quit", "/exit"}:
@@ -325,8 +335,12 @@ class CodingAgentApp(App[None]):
         if command == "/clear":
             self.action_clear_conversation()
             return True
+        if command == "/copy":
+            self.action_copy_last_response()
+            return True
         if command == "/new":
             self.session_id = None
+            self.last_assistant_text = None
             self.action_clear_conversation()
             self._refresh_context()
             self._conversation().write(Text("Started a new session.", style="green"))
@@ -335,8 +349,9 @@ class CodingAgentApp(App[None]):
             self._conversation().write(
                 Text.from_markup(
                     "[bold]/new[/] new session  ·  [bold]/clear[/] clear view  ·  "
-                    "[bold]/exit[/] quit\n"
-                    "[dim]Enter sends · Shift+Enter adds a new line.[/]"
+                    "[bold]/copy[/] copy latest answer  ·  [bold]/exit[/] quit\n"
+                    "[dim]Enter sends · Shift+Enter adds a new line · "
+                    "Ctrl+Y copies the latest answer · select text then Ctrl+C.[/]"
                 )
             )
             return True
