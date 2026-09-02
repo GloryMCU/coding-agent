@@ -238,6 +238,65 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.last_assistant_text, answer)
             self.assertEqual(app._clipboard, answer)
 
+    async def test_each_code_block_has_a_clickable_copy_control(self) -> None:
+        app = self.make_app()
+        answer = (
+            "Examples:\n\n"
+            "```python\nprint('hello')\n```\n\n"
+            "```json\n{\"ok\": true}\n```"
+        )
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.post_agent_event(
+                "model_response",
+                {"tool_calls": [], "text": answer},
+            )
+            await pilot.pause()
+
+            self.assertEqual(
+                list(app._code_blocks.values()),
+                ["print('hello')", '{"ok": true}'],
+            )
+            rendered = "\n".join(
+                line.text for line in app.query_one("#conversation", RichLog).lines
+            )
+            self.assertEqual(rendered.count("⧉ Copy"), 2)
+
+            app.action_copy_code(next(iter(app._code_blocks)))
+            self.assertEqual(app._clipboard, "print('hello')")
+
+    async def test_clicking_code_copy_control_copies_only_that_block(self) -> None:
+        app = self.make_app()
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.post_agent_event(
+                "model_response",
+                {
+                    "tool_calls": [],
+                    "text": "Before\n\n```python\nprint('clicked')\n```\n\nAfter",
+                },
+            )
+            await pilot.pause()
+
+            conversation = app.query_one("#conversation", RichLog)
+            copy_line_index, copy_line = next(
+                (index, line.text)
+                for index, line in enumerate(conversation.lines)
+                if "⧉ Copy" in line.text
+            )
+            await pilot.click(
+                "#conversation",
+                offset=(
+                    conversation.styles.padding.left + copy_line.index("Copy"),
+                    conversation.styles.padding.top
+                    + copy_line_index
+                    - conversation.scroll_offset.y,
+                ),
+            )
+            await pilot.pause()
+
+            self.assertEqual(app._clipboard, "print('clicked')")
+
     async def test_copy_local_command_and_new_session_reset(self) -> None:
         app = self.make_app()
 

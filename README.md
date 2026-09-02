@@ -206,6 +206,7 @@ Footer：快捷键
 
 - `Ctrl+Enter` 或 `Ctrl+S`：发送任务；
 - `Ctrl+Y`：复制最近一条 Agent 回答的原始 Markdown（代码块保持原样）；
+- 点击代码块标题栏右侧的 `⧉ Copy`：只复制该代码块内容；
 - 鼠标选中会话文本后按 `Ctrl+C`：复制选中的局部文本；
 - `Ctrl+L`：清空当前界面，不删除 SQLite 历史；
 - `Ctrl+Q`：退出；

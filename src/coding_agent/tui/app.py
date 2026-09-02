@@ -7,7 +7,11 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, TypeAlias
 
-from rich.markdown import Markdown
+from rich.console import Console, ConsoleOptions, RenderResult
+from rich.markdown import CodeBlock, Markdown
+from rich.style import Style
+from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -30,6 +34,71 @@ from .screens import ApprovalScreen
 
 
 AgentFactory: TypeAlias = Callable[[EventSink, ApprovalPolicy], Agent]
+
+
+class CopyableCodeBlock(CodeBlock):
+    """Markdown code block with a clickable copy control."""
+
+    @classmethod
+    def create(cls, markdown: Markdown, token: Any) -> CopyableCodeBlock:
+        node_info = token.info or ""
+        lexer_name = node_info.partition(" ")[0]
+        code_id = str(token.meta.get("copy_code_id", ""))
+        return cls(lexer_name or "text", markdown.code_theme, code_id)
+
+    def __init__(self, lexer_name: str, theme: str, code_id: str) -> None:
+        super().__init__(lexer_name, theme)
+        self.code_id = code_id
+
+    def __rich_console__(
+        self,
+        console: Console,
+        options: ConsoleOptions,
+    ) -> RenderResult:
+        code = str(self.text).rstrip()
+        header = Table.grid(expand=True, padding=(0, 1))
+        header.style = "on #202020"
+        header.add_column(ratio=1)
+        header.add_column(justify="right")
+        copy_control = Text(
+            "⧉ Copy",
+            style=Style(
+                color="bright_cyan",
+                bold=True,
+                meta={"@click": f"app.copy_code('{self.code_id}')"},
+            ),
+        )
+        header.add_row(Text(self.lexer_name, style="dim"), copy_control)
+        yield header
+        yield Syntax(
+            code,
+            self.lexer_name,
+            theme=self.theme,
+            word_wrap=True,
+            padding=1,
+        )
+
+
+class CopyableMarkdown(Markdown):
+    """Rich Markdown renderer that registers each fenced code block."""
+
+    elements = {
+        **Markdown.elements,
+        "fence": CopyableCodeBlock,
+        "code_block": CopyableCodeBlock,
+    }
+
+    def __init__(
+        self,
+        markup: str,
+        register_code: Callable[[str], str],
+    ) -> None:
+        super().__init__(markup)
+        for token in self.parsed:
+            if token.type in {"fence", "code_block"}:
+                token.meta["copy_code_id"] = register_code(
+                    token.content.rstrip("\n")
+                )
 
 
 class PromptTextArea(TextArea):
@@ -153,6 +222,8 @@ class CodingAgentApp(App[None]):
         self.busy = False
         self.completed_tools = 0
         self.last_assistant_text: str | None = None
+        self._code_blocks: dict[str, str] = {}
+        self._next_code_block_id = 1
         self._activity_label = "Ready"
         self._activity_started_at: float | None = None
 
@@ -288,7 +359,12 @@ class CodingAgentApp(App[None]):
                 self._conversation().write(
                     Text.assemble(("◆ ", "bold green"), ("Agent", "bold green"))
                 )
-                self._conversation().write(Markdown(self.last_assistant_text))
+                self._conversation().write(
+                    CopyableMarkdown(
+                        self.last_assistant_text,
+                        self._register_code_block,
+                    )
+                )
                 self._set_activity("Finishing…")
             return
 
@@ -381,6 +457,7 @@ class CodingAgentApp(App[None]):
 
     def action_clear_conversation(self) -> None:
         self._conversation().clear()
+        self._code_blocks.clear()
         self._conversation().write(Text("Conversation view cleared.", style="dim"))
 
     def action_copy_last_response(self) -> None:
@@ -389,6 +466,20 @@ class CodingAgentApp(App[None]):
             return
         self.copy_to_clipboard(self.last_assistant_text)
         self.notify("Copied the latest agent response.")
+
+    def action_copy_code(self, code_id: str) -> None:
+        code = self._code_blocks.get(code_id)
+        if code is None:
+            self.notify("That code block is no longer available.", severity="warning")
+            return
+        self.copy_to_clipboard(code)
+        self.notify("Copied code block.")
+
+    def _register_code_block(self, code: str) -> str:
+        code_id = f"code-{self._next_code_block_id}"
+        self._next_code_block_id += 1
+        self._code_blocks[code_id] = code
+        return code_id
 
     def _handle_local_command(self, prompt: str) -> bool:
         command = prompt.casefold()
