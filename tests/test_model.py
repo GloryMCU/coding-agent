@@ -203,6 +203,27 @@ class OpenAIMessageParserTests(unittest.TestCase):
             with self.assertRaisesRegex(ModelProtocolError, "without any tool call"):
                 client.generate([], [], timeout_s=12)
 
+    def test_client_treats_empty_response_as_retryable(self) -> None:
+        class FakeCompletions:
+            def create(self, **request: object) -> None:
+                return None
+
+        fake_module = SimpleNamespace(
+            OpenAI=lambda **kwargs: SimpleNamespace(
+                chat=SimpleNamespace(completions=FakeCompletions())
+            )
+        )
+        with patch.dict(sys.modules, {"openai": fake_module}):
+            client = DeepSeekV4ProClient(api_key="test-key")
+            with self.assertRaisesRegex(
+                ModelRequestError,
+                "empty response",
+            ) as raised:
+                client.generate([], [], timeout_s=12)
+
+        self.assertTrue(raised.exception.retryable)
+        self.assertIsNone(raised.exception.status_code)
+
     def test_client_classifies_http_failures_for_retry(self) -> None:
         cases = (
             (400, False, "request rejected"),

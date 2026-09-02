@@ -134,6 +134,11 @@ class OpenAIChatClient:
         except Exception as exc:  # Vendor exception types vary by client version.
             raise _classify_model_request_error(exc) from exc
 
+        if completion is None:
+            raise ModelRequestError(
+                "model returned an empty response",
+                retryable=True,
+            )
         if not completion.choices:
             raise ModelProtocolError("model response contains no choices")
 

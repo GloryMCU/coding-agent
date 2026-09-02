@@ -138,7 +138,9 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Inspect the project", rendered)
             self.assertIn("Finished", rendered)
 
-    async def test_enter_submits_and_shift_enter_inserts_a_newline(self) -> None:
+    async def test_enter_and_shift_enter_insert_newlines_and_ctrl_s_submits(
+        self,
+    ) -> None:
         app = self.make_app()
 
         async with app.run_test(size=(100, 32)) as pilot:
@@ -151,12 +153,19 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
 
             prompt.insert("Second line")
             await pilot.press("enter")
+            self.assertEqual(prompt.text, "First line\nSecond line\n")
+
+            prompt.insert("Third line")
+            await pilot.press("ctrl+s")
             for _ in range(100):
                 await pilot.pause(0.01)
                 if not app.busy:
                     break
 
-            self.assertEqual(self.stub.prompts, ["First line\nSecond line"])
+            self.assertEqual(
+                self.stub.prompts,
+                ["First line\nSecond line\nThird line"],
+            )
 
     async def test_tool_details_are_replaced_by_status_and_not_logged(self) -> None:
         app = self.make_app()

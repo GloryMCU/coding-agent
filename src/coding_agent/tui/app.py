@@ -102,16 +102,17 @@ class CopyableMarkdown(Markdown):
 
 
 class PromptTextArea(TextArea):
-    """Composer that sends on Enter while retaining Shift+Enter for new lines."""
+    """Multiline composer with an explicit Shift+Enter newline binding."""
 
     BINDINGS = [
-        Binding("enter", "submit", "Send", show=False, priority=True),
-        Binding("shift+enter", "insert_newline", "New line", show=False),
+        Binding(
+            "shift+enter",
+            "insert_newline",
+            "New line",
+            show=False,
+            priority=True,
+        ),
     ]
-
-    def action_submit(self) -> None:
-        if not self.disabled:
-            self.app.action_submit_prompt()
 
     def action_insert_newline(self) -> None:
         start, end = self.selection
@@ -125,7 +126,14 @@ class CodingAgentApp(App[None]):
     ENABLE_COMMAND_PALETTE = False
 
     BINDINGS = [
-        Binding("ctrl+enter", "submit_prompt", "Send", priority=True),
+        Binding(
+            "ctrl+enter",
+            "submit_prompt",
+            "Send",
+            show=False,
+            priority=True,
+        ),
+        Binding("ctrl+s", "submit_prompt", "Send", priority=True),
         Binding("ctrl+y", "copy_last_response", "Copy answer", priority=True),
         Binding("ctrl+l", "clear_conversation", "Clear", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
@@ -238,7 +246,10 @@ class CodingAgentApp(App[None]):
             auto_scroll=True,
         )
         with Vertical(id="composer"):
-            yield Static("Ready  ·  Enter send  ·  Shift+Enter new line", id="activity")
+            yield Static(
+                "Ready  ·  Enter new line  ·  Ctrl+S send",
+                id="activity",
+            )
             yield PromptTextArea(
                 "",
                 id="prompt",
@@ -504,7 +515,7 @@ class CodingAgentApp(App[None]):
                 Text.from_markup(
                     "[bold]/new[/] new session  ·  [bold]/clear[/] clear view  ·  "
                     "[bold]/copy[/] copy latest answer  ·  [bold]/exit[/] quit\n"
-                    "[dim]Enter sends · Shift+Enter adds a new line · "
+                    "[dim]Enter adds a new line · Ctrl+S sends · "
                     "Ctrl+Y copies the latest answer · select text then Ctrl+C.[/]"
                 )
             )
@@ -544,7 +555,7 @@ class CodingAgentApp(App[None]):
                 self._set_activity(activity, track_elapsed=True)
             else:
                 self._set_activity(
-                    f"{activity}  ·  Enter send  ·  Shift+Enter new line"
+                    f"{activity}  ·  Enter new line  ·  Ctrl+S send"
                 )
 
     def _set_activity(self, activity: str, *, track_elapsed: bool = False) -> None:
