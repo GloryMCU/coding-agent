@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ You cannot call tools in this response. Give the user a truthful text-only hando
 - summarizes completed work and available verification evidence;
 - lists unfinished or unverified work;
 - recommends the most useful next action.
+Output ordinary prose only. Do not emit tool-call syntax, XML-like tool tags, or DSML markers.
 Do not claim the task is complete unless the conversation already contains sufficient evidence.
 Finalization reason: {reason}
 Verification state: {verification_state}
@@ -55,6 +57,12 @@ Termination reason: {reason}
 Verification state: {verification_state}
 
 Review the completed tool results above, then continue the task in a new turn if more work is needed."""
+
+_TEXTUAL_TOOL_CALL_MARKUP = re.compile(
+    r"<\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}\s*"
+    r"(?:tool\\?_calls|invoke|parameter)\b",
+    re.IGNORECASE,
+)
 
 FINISH_TASK_TOOL = {
     "type": "function",
@@ -105,6 +113,8 @@ class VerificationMode(StrEnum):
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     max_steps: int = 30
+    max_total_steps: int | None = None
+    step_extension: int = 15
     model_timeout_s: float = 60.0
     max_model_retries: int = 2
     retry_base_delay_s: float = 0.5
@@ -119,6 +129,11 @@ class AgentConfig:
     def __post_init__(self) -> None:
         if self.max_steps < 1:
             raise ValueError("max_steps must be >= 1")
+        if self.step_extension < 1:
+            raise ValueError("step_extension must be >= 1")
+        if self.max_total_steps is not None:
+            if self.max_total_steps < self.max_steps:
+                raise ValueError("max_total_steps must be >= max_steps")
         if self.model_timeout_s <= 0:
             raise ValueError("model_timeout_s must be > 0")
         if self.max_model_retries < 0:
@@ -281,9 +296,17 @@ class Agent:
         successful_tool_call_ids: set[str] = set()
         mutation_tool_call_ids: set[str] = set()
         finalization_reason: str | None = None
-        for step in range(1, self._config.max_steps + 1):
+        step_limit = self._config.max_steps
+        progress_checkpoint = 0
+        for step in range(1, self._hard_step_limit + 1):
+            if finalization_reason is None and step == step_limit:
+                step_limit, progress_checkpoint = self._maybe_extend_step_budget(
+                    step_limit=step_limit,
+                    successful_tool_calls=len(successful_tool_call_ids),
+                    progress_checkpoint=progress_checkpoint,
+                )
             finalization_step = (
-                finalization_reason is not None or step == self._config.max_steps
+                finalization_reason is not None or step == step_limit
             )
             if finalization_step:
                 reason = finalization_reason or "maximum model steps reached"
@@ -314,6 +337,7 @@ class Agent:
 
                 self._emit_model_request_started(
                     step=step,
+                    step_limit=step_limit,
                     finalizing=True,
                 )
                 model_started = time.monotonic()
@@ -350,7 +374,7 @@ class Agent:
                     status=status,
                 )
 
-            self._emit_model_request_started(step=step)
+            self._emit_model_request_started(step=step, step_limit=step_limit)
             model_started = time.monotonic()
             response = self._request_model(state.messages)
             model_duration_ms = round((time.monotonic() - model_started) * 1000)
@@ -585,9 +609,18 @@ class Agent:
 
             progress = _NoProgressTracker(self._config)
             finalization_reason: str | None = None
-            for step in range(1, self._config.max_steps + 1):
+            step_limit = self._config.max_steps
+            progress_checkpoint = len(successful_tool_call_ids)
+            for step in range(1, self._hard_step_limit + 1):
+                if finalization_reason is None and step == step_limit:
+                    step_limit, progress_checkpoint = self._maybe_extend_step_budget(
+                        step_limit=step_limit,
+                        successful_tool_calls=len(successful_tool_call_ids),
+                        progress_checkpoint=progress_checkpoint,
+                        session_id=session_id,
+                    )
                 finalization_step = (
-                    finalization_reason is not None or step == self._config.max_steps
+                    finalization_reason is not None or step == step_limit
                 )
                 if finalization_step:
                     reason = finalization_reason or "maximum model steps reached"
@@ -624,6 +657,7 @@ class Agent:
 
                     self._emit_model_request_started(
                         step=step,
+                        step_limit=step_limit,
                         session_id=session_id,
                         finalizing=True,
                     )
@@ -672,6 +706,7 @@ class Agent:
 
                 self._emit_model_request_started(
                     step=step,
+                    step_limit=step_limit,
                     session_id=session_id,
                 )
                 model_started = time.monotonic()
@@ -1010,17 +1045,53 @@ class Agent:
         self,
         *,
         step: int,
+        step_limit: int,
         session_id: str | None = None,
         finalizing: bool = False,
     ) -> None:
         payload: dict[str, object] = {
             "step": step,
-            "max_steps": self._config.max_steps,
+            "max_steps": step_limit,
+            "max_total_steps": self._hard_step_limit,
             "finalizing": finalizing,
         }
         if session_id is not None:
             payload["session_id"] = session_id
         self._events.emit("model_request_started", payload)
+
+    @property
+    def _hard_step_limit(self) -> int:
+        return self._config.max_total_steps or self._config.max_steps
+
+    def _maybe_extend_step_budget(
+        self,
+        *,
+        step_limit: int,
+        successful_tool_calls: int,
+        progress_checkpoint: int,
+        session_id: str | None = None,
+    ) -> tuple[int, int]:
+        hard_limit = self._hard_step_limit
+        if (
+            step_limit >= hard_limit
+            or successful_tool_calls <= progress_checkpoint
+        ):
+            return step_limit, progress_checkpoint
+
+        extended_limit = min(
+            step_limit + self._config.step_extension,
+            hard_limit,
+        )
+        payload: dict[str, object] = {
+            "previous_limit": step_limit,
+            "max_steps": extended_limit,
+            "max_total_steps": hard_limit,
+            "successful_tool_calls": successful_tool_calls,
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+        self._events.emit("step_budget_extended", payload)
+        return extended_limit, successful_tool_calls
 
     def _emit_tool_started(
         self,
@@ -1111,6 +1182,19 @@ class Agent:
                 reason=reason,
                 verification_state=verification_state,
                 error=str(exc),
+                session_id=session_id,
+            )
+            return self._fallback_finalization_response(reason, verification_state)
+
+        if response.text and _TEXTUAL_TOOL_CALL_MARKUP.search(response.text):
+            self._emit_finalization_fallback(
+                step=step,
+                reason=reason,
+                verification_state=verification_state,
+                error=(
+                    "model returned textual DSML tool-call markup during the "
+                    "text-only finalization step"
+                ),
                 session_id=session_id,
             )
             return self._fallback_finalization_response(reason, verification_state)

@@ -143,7 +143,8 @@ coding-agent --no-thinking --workspace . "读取 README.md"
 coding-agent --max-context-tokens 262144 --context-summary-tokens 16384 `
   --workspace . "继续长会话"
 coding-agent --history-search-limit 8 --workspace . "回顾之前的数据库决策"
-coding-agent --max-steps 50 --workspace . "执行特别长的重构任务"
+coding-agent --max-steps 40 --max-total-steps 160 --step-extension 20 `
+  --workspace . "执行特别长的重构任务"
 coding-agent --approval-mode deny --workspace . "只读分析这个仓库"
 coding-agent --approval-mode ask --workspace . "逐项审查这个不可信仓库"
 coding-agent --approval-timeout-s 300 --workspace . "运行需要审批的任务"
@@ -165,9 +166,15 @@ coding-agent --model-timeout-s 180 --max-model-retries 5 `
 HTTP 408/409/425/429、5xx 和没有 HTTP 状态码的传输错误会重试；400、401、403、404、
 422 等永久请求错误会立即停止，并在 CLI/TUI 中显示简洁的可操作错误信息。
 
-每个顶层任务默认最多使用 30 个模型步骤。最后一个步骤不再提供任何工具，而是要求
-模型输出纯文本交接，明确已完成、未完成、验证状态和下一步，因此不会在预算耗尽前的
-最后一轮留下新的未验证修改。若此前存在工作区变更，核心会在最终交接前主动运行一次
+每个 CLI 顶层任务初始使用 30 个模型步骤；到达当前软上限时，如果自上次预算检查后
+出现了新的成功工具调用，预算会自动增加 15 步，硬上限默认为 100 步。可分别使用
+`--max-steps`、`--step-extension` 和 `--max-total-steps` 调整。直接使用 Python API 时，
+`AgentConfig.max_total_steps` 默认为 `None`，因此保持固定 `max_steps` 的原有行为；设置
+硬上限后才启用自动续期。
+
+没有新成功结果、检测到无进展或达到硬上限时，最后一个步骤不再提供任何工具，而是
+要求模型输出纯文本交接，明确已完成、未完成、验证状态和下一步，因此不会在预算耗尽前
+的最后一轮留下新的未验证修改。若此前存在工作区变更，核心会在最终交接前主动运行一次
 `verify_project`。正常完成状态为 `completed`；预算耗尽或检测到无进展时为 `partial`；
 验证或外部条件无法继续时为 `blocked`；用户中断和不可恢复故障分别记录为
 `interrupted`、`failed`。持久会话可以在 `partial` 或 `blocked` 后继续。

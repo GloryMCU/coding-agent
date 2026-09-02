@@ -212,10 +212,16 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 32)):
             app.post_agent_event(
                 "model_request_started",
-                {"step": 2, "max_steps": 30, "finalizing": False},
+                {
+                    "step": 2,
+                    "max_steps": 30,
+                    "max_total_steps": 100,
+                    "finalizing": False,
+                },
             )
             activity = str(app.query_one("#activity", Static).render())
             self.assertIn("Model step 2/30", activity)
+            self.assertIn("hard limit 100", activity)
             self.assertIn("waiting for model", activity)
 
             assert app._activity_started_at is not None

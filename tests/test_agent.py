@@ -967,6 +967,147 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(model.tool_requests[1], [])
         self.assertIn("maximum model steps", model.requests[1][0]["content"])
 
+    def test_successful_progress_extends_step_budget_up_to_hard_limit(self) -> None:
+        for index in range(1, 6):
+            (self.workspace / f"file-{index}.txt").write_text(
+                f"file {index}\n",
+                encoding="utf-8",
+            )
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"read-{index}",
+                            name="read_file",
+                            arguments={"path": f"file-{index}.txt"},
+                        )
+                    ]
+                )
+                for index in range(1, 6)
+            ]
+            + [ModelResponse.from_parts(text="Hard-limit handoff.")]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            config=AgentConfig(
+                max_steps=2,
+                max_total_steps=6,
+                step_extension=2,
+            ),
+            events=events,
+        )
+
+        result = agent.run("Inspect until the hard limit")
+
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.termination_reason, "max_steps")
+        self.assertEqual(result.steps, 6)
+        self.assertTrue(all(model.tool_requests[index] for index in range(5)))
+        self.assertEqual(model.tool_requests[5], [])
+        extensions = [
+            payload
+            for event_type, payload in events.events
+            if event_type == "step_budget_extended"
+        ]
+        self.assertEqual(len(extensions), 2)
+        self.assertEqual(extensions[0]["previous_limit"], 2)
+        self.assertEqual(extensions[0]["max_steps"], 4)
+        self.assertEqual(extensions[1]["previous_limit"], 4)
+        self.assertEqual(extensions[1]["max_steps"], 6)
+        self.assertEqual(extensions[1]["max_total_steps"], 6)
+
+    def test_failed_tools_do_not_extend_step_budget(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="missing-1",
+                            name="missing_tool",
+                            arguments={},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(text="Stopped without progress."),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=ToolRegistry(),
+            config=AgentConfig(
+                max_steps=2,
+                max_total_steps=6,
+                step_extension=2,
+            ),
+            events=events,
+        )
+
+        result = agent.run("Try a missing tool")
+
+        self.assertEqual(result.steps, 2)
+        self.assertEqual(model.tool_requests[-1], [])
+        self.assertFalse(
+            any(event_type == "step_budget_extended" for event_type, _ in events.events)
+        )
+
+    def test_extension_requires_new_progress_since_previous_checkpoint(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="read-1",
+                            name="read_file",
+                            arguments={"path": "README.md"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="missing-1", name="missing_one", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="missing-2", name="missing_two", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(text="Stopped after progress stalled."),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            config=AgentConfig(
+                max_steps=2,
+                max_total_steps=6,
+                step_extension=2,
+            ),
+            events=events,
+        )
+
+        result = agent.run("Stop extending after progress stalls")
+
+        self.assertEqual(result.steps, 4)
+        extensions = [
+            payload
+            for event_type, payload in events.events
+            if event_type == "step_budget_extended"
+        ]
+        self.assertEqual(len(extensions), 1)
+        self.assertEqual(extensions[0]["max_steps"], 4)
+
+    def test_adaptive_step_budget_configuration_is_validated(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_total_steps"):
+            AgentConfig(max_steps=10, max_total_steps=9)
+        with self.assertRaisesRegex(ValueError, "step_extension"):
+            AgentConfig(step_extension=0)
+
     def test_finalization_falls_back_when_model_cannot_return_text(self) -> None:
         for final_response in (
             ModelResponse.from_parts(
@@ -1012,6 +1153,49 @@ class AgentLoopTests(unittest.TestCase):
                     )
                 )
 
+    def test_finalization_rejects_textual_dsml_tool_calls(self) -> None:
+        dsml = (
+            '<｜｜DSML｜｜tool\\_calls> '
+            '<｜｜DSML｜｜invoke name="read\\_file"> '
+            '<｜｜DSML｜｜parameter name="path" string="true">'
+            '.idea/modules.xml</｜｜DSML｜｜parameter> '
+            '</｜｜DSML｜｜invoke> </｜｜DSML｜｜tool\\_calls>'
+        )
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="read-1",
+                            name="read_file",
+                            arguments={"path": "README.md"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(text=dsml),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            config=AgentConfig(max_steps=2),
+            events=events,
+        )
+
+        result = agent.run("Inspect README.md")
+
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertNotIn("DSML", result.text)
+        self.assertIn("could not generate its normal text-only handoff", result.text)
+        fallback_events = [
+            payload
+            for event_type, payload in events.events
+            if event_type == "finalization_fallback"
+        ]
+        self.assertEqual(len(fallback_events), 1)
+        self.assertIn("textual DSML", fallback_events[0]["error"])
+
     def test_persisted_max_steps_records_partial_session_status(self) -> None:
         model = FakeModel(
             [
@@ -1045,6 +1229,64 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIsNotNone(result.session_id)
         assert result.session_id is not None
         self.assertEqual(store.get_session(result.session_id).status, "partial")
+
+    def test_persisted_session_extends_step_budget_on_new_progress(self) -> None:
+        (self.workspace / "second.txt").write_text("second\n", encoding="utf-8")
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="read-1",
+                            name="read_file",
+                            arguments={"path": "README.md"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="read-2",
+                            name="read_file",
+                            arguments={"path": "second.txt"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(text="Persisted hard-limit handoff."),
+            ]
+        )
+        events = RecordingEventSink()
+        store = SqliteConversationStore(
+            self.workspace / ".coding-agent" / "history.sqlite3"
+        )
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            config=AgentConfig(
+                max_steps=2,
+                max_total_steps=3,
+                step_extension=1,
+            ),
+            events=events,
+            store=store,
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        result = agent.run("Inspect two files")
+
+        self.assertEqual(result.steps, 3)
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertIsNotNone(result.session_id)
+        assert result.session_id is not None
+        self.assertEqual(store.get_session(result.session_id).status, "partial")
+        extension = next(
+            payload
+            for event_type, payload in events.events
+            if event_type == "step_budget_extended"
+        )
+        self.assertEqual(extension["session_id"], result.session_id)
+        self.assertEqual(extension["max_steps"], 3)
 
     def test_consecutive_tool_errors_trigger_no_progress_handoff(self) -> None:
         model = FakeModel(

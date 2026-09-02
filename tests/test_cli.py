@@ -21,6 +21,8 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.reasoning_effort, "high")
         self.assertTrue(args.thinking)
         self.assertEqual(args.max_steps, 30)
+        self.assertIsNone(args.max_total_steps)
+        self.assertEqual(args.step_extension, 15)
         self.assertEqual(args.model_timeout_s, 60.0)
         self.assertEqual(args.max_model_retries, 2)
         self.assertEqual(args.retry_base_delay_s, 0.5)
@@ -86,6 +88,23 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.model_timeout_s, 180.0)
         self.assertEqual(args.max_model_retries, 5)
         self.assertEqual(args.retry_base_delay_s, 1.5)
+
+    def test_adaptive_step_budget_can_be_configured(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--max-steps",
+                "40",
+                "--max-total-steps",
+                "160",
+                "--step-extension",
+                "20",
+                "Inspect README.md",
+            ]
+        )
+
+        self.assertEqual(args.max_steps, 40)
+        self.assertEqual(args.max_total_steps, 160)
+        self.assertEqual(args.step_extension, 20)
 
     def test_approval_timeout_can_be_configured(self) -> None:
         args = build_parser().parse_args(

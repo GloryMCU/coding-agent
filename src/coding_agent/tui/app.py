@@ -341,9 +341,15 @@ class CodingAgentApp(App[None]):
         if event_type == "model_request_started":
             step = payload.get("step", "?")
             max_steps = payload.get("max_steps")
+            max_total_steps = payload.get("max_total_steps")
             step_label = f"Model step {step}"
             if max_steps is not None:
                 step_label += f"/{max_steps}"
+            if (
+                max_total_steps is not None
+                and max_total_steps != max_steps
+            ):
+                step_label += f" (hard limit {max_total_steps})"
             phase = (
                 "finalizing response"
                 if payload.get("finalizing")

@@ -69,8 +69,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help=(
-            "Maximum model steps per task, including a final text-only handoff "
-            "step (default: 30)"
+            "Initial model-step budget per task, including a reserved text-only "
+            "handoff step (default: 30)"
+        ),
+    )
+    parser.add_argument(
+        "--max-total-steps",
+        type=int,
+        default=None,
+        help=(
+            "Hard model-step limit after adaptive extensions; defaults to the "
+            "larger of 100 and --max-steps"
+        ),
+    )
+    parser.add_argument(
+        "--step-extension",
+        type=int,
+        default=15,
+        help=(
+            "Steps added at a soft limit when successful tool progress was made "
+            "since the previous extension (default: 15)"
         ),
     )
     parser.add_argument(
@@ -255,6 +273,12 @@ def main() -> int:
             ),
             config=AgentConfig(
                 max_steps=args.max_steps,
+                max_total_steps=(
+                    args.max_total_steps
+                    if args.max_total_steps is not None
+                    else max(100, args.max_steps)
+                ),
+                step_extension=args.step_extension,
                 model_timeout_s=args.model_timeout_s,
                 max_model_retries=args.max_model_retries,
                 retry_base_delay_s=args.retry_base_delay_s,
