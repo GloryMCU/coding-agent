@@ -232,7 +232,7 @@ class ContainerSandbox:
         working_directory: Path,
         command: list[str],
         *,
-        timeout_s: int,
+        timeout_s: float,
         max_output_chars: int,
     ) -> dict[str, Any]:
         container_name = f"coding-agent-{uuid.uuid4().hex}"
@@ -257,10 +257,13 @@ class ContainerSandbox:
             stdout, stderr = process.communicate(timeout=timeout_s)
             exit_code: int | None = process.returncode
             timed_out = False
-        except subprocess.TimeoutExpired:
+            cleanup_incomplete = False
+        except subprocess.TimeoutExpired as exc:
             _force_remove_container(self.runtime, container_name)
-            _terminate_process_tree(process)
-            stdout, stderr = process.communicate()
+            stdout, stderr, cleanup_incomplete = _collect_after_timeout(
+                process,
+                exc,
+            )
             exit_code = None
             timed_out = True
         stdout, stdout_truncated = _truncate_output(stdout, max_output_chars)
@@ -270,6 +273,7 @@ class ContainerSandbox:
             "cwd": working_directory.relative_to(workspace).as_posix() or ".",
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "cleanup_incomplete": cleanup_incomplete,
             "duration_ms": round((time.monotonic() - started) * 1000),
             "stdout": stdout,
             "stderr": stderr,
@@ -379,7 +383,7 @@ class ControlledCommandRunner:
         argv: list[str] | tuple[str, ...],
         *,
         cwd: str = ".",
-        timeout_s: int = 120,
+        timeout_s: float = 120,
     ) -> dict[str, Any]:
         if not 1 <= timeout_s <= 300:
             raise ToolArgumentsError("timeout_s must be between 1 and 300")
@@ -412,9 +416,12 @@ class ControlledCommandRunner:
             stdout, stderr = process.communicate(timeout=timeout_s)
             exit_code: int | None = process.returncode
             timed_out = False
-        except subprocess.TimeoutExpired:
-            _terminate_process_tree(process)
-            stdout, stderr = process.communicate()
+            cleanup_incomplete = False
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr, cleanup_incomplete = _collect_after_timeout(
+                process,
+                exc,
+            )
             exit_code = None
             timed_out = True
         stdout, stdout_truncated = _truncate_output(stdout, self.max_output_chars)
@@ -424,6 +431,7 @@ class ControlledCommandRunner:
             "cwd": self.policy.display_path(working_directory),
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "cleanup_incomplete": cleanup_incomplete,
             "duration_ms": round((time.monotonic() - started) * 1000),
             "stdout": stdout,
             "stderr": stderr,
@@ -640,8 +648,15 @@ def run_verification_plan(
     workspace: Path,
     *,
     kind: str,
-    timeout_s: int,
+    timeout_s: float,
+    total_timeout_s: float = 300,
 ) -> dict[str, Any]:
+    if timeout_s <= 0:
+        raise ToolArgumentsError("verification command timeout must be positive")
+    if total_timeout_s <= 0:
+        raise ToolArgumentsError("verification total timeout must be positive")
+    started = time.monotonic()
+    deadline = started + total_timeout_s
     plan = discover_verification_plan(workspace, kind)
     requested_checks = (
         {"test", "build", "format_check"} if kind == "all" else {kind}
@@ -649,13 +664,30 @@ def run_verification_plan(
     planned_checks = {command.label for command in plan}
     skipped_checks = sorted(requested_checks - planned_checks)
     results = []
+    total_time_limit_reached = False
     for command in plan:
-        result = runner.run(command.argv, cwd=command.cwd, timeout_s=timeout_s)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            total_time_limit_reached = True
+            break
+        result = runner.run(
+            command.argv,
+            cwd=command.cwd,
+            timeout_s=min(timeout_s, remaining),
+        )
         results.append({"check": command.label, **result})
+        if time.monotonic() >= deadline:
+            total_time_limit_reached = True
         if result["timed_out"] or result["exit_code"] != 0:
             break
-    ok = bool(plan) and len(results) == len(plan) and all(
-        item["exit_code"] == 0 and not item["timed_out"] for item in results
+    ok = (
+        not total_time_limit_reached
+        and bool(plan)
+        and len(results) == len(plan)
+        and all(
+            item["exit_code"] == 0 and not item["timed_out"]
+            for item in results
+        )
     )
     return {
         "kind": kind,
@@ -670,6 +702,10 @@ def run_verification_plan(
         "skipped_checks": skipped_checks,
         "ok": ok,
         "complete": ok and not skipped_checks,
+        "timed_out": total_time_limit_reached
+        or any(item["timed_out"] for item in results),
+        "total_timeout_s": total_timeout_s,
+        "duration_ms": round((time.monotonic() - started) * 1000),
         "skipped": not plan,
         "skip_reason": "no configured verification command was detected" if not plan else None,
     }
@@ -782,6 +818,44 @@ def _sanitized_environment() -> dict[str, str]:
         }
     )
     return environment
+
+
+def _collect_after_timeout(
+    process: subprocess.Popen[str],
+    initial_timeout: subprocess.TimeoutExpired,
+    *,
+    cleanup_timeout_s: float = 5,
+) -> tuple[str, str, bool]:
+    """Terminate a process tree and collect output without another unbounded wait."""
+
+    stdout = _timeout_stream_text(initial_timeout.output)
+    stderr = _timeout_stream_text(initial_timeout.stderr)
+    _terminate_process_tree(process)
+    try:
+        final_stdout, final_stderr = process.communicate(timeout=cleanup_timeout_s)
+        return final_stdout or stdout, final_stderr or stderr, False
+    except subprocess.TimeoutExpired as cleanup_timeout:
+        stdout = _timeout_stream_text(cleanup_timeout.output) or stdout
+        stderr = _timeout_stream_text(cleanup_timeout.stderr) or stderr
+        try:
+            process.kill()
+        except OSError:
+            pass
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        return stdout, stderr, True
+
+
+def _timeout_stream_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:

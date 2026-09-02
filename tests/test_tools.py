@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -99,6 +100,20 @@ class ReadFileToolTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("absolute paths are not allowed", result.error or "")
 
+    def test_read_file_stops_at_operation_time_limit(self) -> None:
+        with patch("coding_agent.tools._deadline_reached", return_value=True):
+            result = self.registry.execute(
+                ToolCall(
+                    id="read-timeout",
+                    name="read_file",
+                    arguments={"path": "notes.txt"},
+                )
+            )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.output["truncated"])
+        self.assertIn("time_limit", result.output["truncation_reasons"])
+
 
 class SearchTextToolTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -187,6 +202,90 @@ class SearchTextToolTests(unittest.TestCase):
         )
         self.assertTrue(result.output["search_statistics_complete"])
 
+    def test_python_search_returns_partial_result_at_time_limit(self) -> None:
+        registry = create_read_only_registry(
+            self.workspace,
+            max_search_duration_s=1,
+        )
+        with (
+            patch("coding_agent.tools.shutil.which", return_value=None),
+            patch("coding_agent.tools._deadline_reached", return_value=True),
+        ):
+            result = registry.execute(
+                ToolCall(
+                    id="python-timeout",
+                    name="search_text",
+                    arguments={"query": "hello"},
+                )
+            )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["search_backend"], "python")
+        self.assertTrue(result.output["truncated"])
+        self.assertIn("time_limit", result.output["truncation_reasons"])
+
+    def test_stops_ripgrep_when_output_pipe_exceeds_time_limit(self) -> None:
+        released = threading.Event()
+
+        class BlockingStdout:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                released.wait(timeout=2)
+                raise StopIteration
+
+            def close(self) -> None:
+                released.set()
+
+        class BlockingProcess:
+            def __init__(self) -> None:
+                self.stdout = BlockingStdout()
+                self.returncode: int | None = None
+                self.terminated = False
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.terminated = True
+                self.returncode = -15
+                released.set()
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                released.set()
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -9
+                released.set()
+
+        process = BlockingProcess()
+        registry = create_read_only_registry(
+            self.workspace,
+            max_search_duration_s=0.02,
+        )
+        with (
+            patch("coding_agent.tools.shutil.which", return_value=sys.executable),
+            patch("coding_agent.tools.subprocess.Popen", return_value=process),
+        ):
+            result = registry.execute(
+                ToolCall(
+                    id="ripgrep-timeout",
+                    name="search_text",
+                    arguments={"query": "hello"},
+                )
+            )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(process.terminated)
+        self.assertEqual(result.output["search_backend"], "ripgrep")
+        self.assertTrue(result.output["truncated"])
+        self.assertIn("time_limit", result.output["truncation_reasons"])
+
     def test_refuses_a_workspace_local_ripgrep_executable(self) -> None:
         fake_ripgrep = self.workspace / "rg.exe"
         fake_ripgrep.write_bytes(b"not an executable")
@@ -202,15 +301,13 @@ class SearchTextToolTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(shutil.which("rg"), "ripgrep is not installed")
-    def test_falls_back_for_python_regex_unsupported_by_ripgrep(self) -> None:
+    def test_rejects_regex_unsupported_by_ripgrep_instead_of_unbounded_fallback(
+        self,
+    ) -> None:
         result = self.search(query=r"(?=hello)hello", regex=True)
 
-        self.assertTrue(result.ok, result.error)
-        self.assertEqual(result.output["search_backend"], "python")
-        self.assertEqual(
-            result.output["ripgrep_fallback_reason"], "ripgrep_search_failed"
-        )
-        self.assertGreater(result.output["match_count"], 0)
+        self.assertFalse(result.ok)
+        self.assertIn("cannot be safely time-bounded", result.error or "")
 
     def test_can_limit_path_glob_and_case(self) -> None:
         result = self.search(
@@ -235,6 +332,7 @@ class SearchTextToolTests(unittest.TestCase):
         self.assertEqual(result.output["matches"][0]["column_number"], 4)
         self.assertEqual(result.output["matches"][0]["end_column_number"], 8)
 
+    @unittest.skipUnless(shutil.which("rg"), "regex search requires ripgrep")
     def test_supports_regex_multiple_patterns_exclusions_and_context(self) -> None:
         result = self.search(
             query=r"hello\s+hello",
@@ -261,6 +359,13 @@ class SearchTextToolTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("invalid regular expression", result.error or "")
+
+    def test_regex_requires_ripgrep_for_bounded_execution(self) -> None:
+        with patch("coding_agent.tools.shutil.which", return_value=None):
+            result = self.search(query=r"hello.*world", regex=True)
+
+        self.assertFalse(result.ok)
+        self.assertIn("requires a working ripgrep", result.error or "")
 
     def test_honors_result_limit(self) -> None:
         result = self.search(query="hello", max_results=2)
@@ -403,6 +508,28 @@ class WorkspaceMutationToolTests(unittest.TestCase):
         self.assertFalse(rejected.ok)
         self.assertIn("regular file", rejected.error or "")
 
+    def test_delete_refuses_oversized_or_slow_hashing(self) -> None:
+        large = self.workspace / "large.bin"
+        large.write_bytes(b"1234")
+        bounded = create_workspace_registry(self.workspace, max_delete_bytes=3)
+
+        oversized = bounded.execute(
+            ToolCall(
+                id="delete-large",
+                name="delete_file",
+                arguments={"path": "large.bin"},
+            )
+        )
+        self.assertFalse(oversized.ok)
+        self.assertIn("deletion limit", oversized.error or "")
+        self.assertTrue(large.exists())
+
+        with patch("coding_agent.tools._deadline_reached", return_value=True):
+            timed_out = self.execute("delete_file", path="large.bin")
+        self.assertFalse(timed_out.ok)
+        self.assertIn("hashing exceeded", timed_out.error or "")
+        self.assertTrue(large.exists())
+
     def test_mutations_reject_path_traversal(self) -> None:
         for tool_name, arguments in [
             ("write_file", {"path": "../new.py", "content": "x"}),
@@ -501,6 +628,16 @@ class FileDiscoveryToolTests(unittest.TestCase):
             [item["path"] for item in result.output["files"]],
             ["src/nested.py", "visible.py"],
         )
+
+    def test_file_discovery_returns_partial_results_at_time_limit(self) -> None:
+        with patch("coding_agent.tools._deadline_reached", return_value=True):
+            listed = self.execute("list_files", recursive=True)
+            globbed = self.execute("glob_files", patterns=["*.py"])
+
+        for result in (listed, globbed):
+            self.assertTrue(result.ok, result.error)
+            self.assertTrue(result.output["truncated"])
+            self.assertIn("time_limit", result.output["truncation_reasons"])
 
 
 class GitReadOnlyToolTests(unittest.TestCase):

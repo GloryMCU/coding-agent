@@ -15,6 +15,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
+from queue import Empty, Full, Queue
+from threading import Event, Thread
+from time import monotonic
 from typing import Any, Callable
 
 from .conversation import Message
@@ -213,6 +216,8 @@ def create_read_only_registry(
     max_file_bytes: int = 64 * 1024,
     max_search_file_bytes: int = 1024 * 1024,
     max_search_output_chars: int = 128 * 1024,
+    max_search_duration_s: float = 30.0,
+    max_file_operation_duration_s: float = 30.0,
     approval_policy: ApprovalPolicy | None = None,
 ) -> ToolRegistry:
     if max_file_bytes < 1:
@@ -221,11 +226,16 @@ def create_read_only_registry(
         raise ValueError("max_search_file_bytes must be >= 1")
     if max_search_output_chars < 1:
         raise ValueError("max_search_output_chars must be >= 1")
+    if max_search_duration_s <= 0:
+        raise ValueError("max_search_duration_s must be > 0")
+    if max_file_operation_duration_s <= 0:
+        raise ValueError("max_file_operation_duration_s must be > 0")
 
     policy = WorkspacePolicy(Path(workspace))
     registry = ToolRegistry(approval_policy=approval_policy)
 
     def read_file(arguments: dict[str, Any]) -> dict[str, Any]:
+        deadline = monotonic() + max_file_operation_duration_s
         path = policy.resolve_read_path(arguments["path"])
         start_line = arguments.get("start_line", 1)
         end_line = arguments.get("end_line")
@@ -235,9 +245,14 @@ def create_read_only_registry(
         selected = bytearray()
         selected_line_count = 0
         output_truncated = False
+        time_limit_reached = False
         current_line = 1
         with path.open("rb") as stream:
             while True:
+                if _deadline_reached(deadline):
+                    output_truncated = True
+                    time_limit_reached = True
+                    break
                 # A size-limited readline keeps a malicious single-line file from
                 # forcing an unbounded allocation while still allowing the caller
                 # to page to lines located well beyond the output limit.
@@ -275,6 +290,11 @@ def create_read_only_registry(
             "content": "\n".join(lines),
             "bytes_returned": len(selected),
             "truncated": output_truncated,
+            "truncation_reasons": (
+                ["time_limit"]
+                if time_limit_reached
+                else (["output_size_limit"] if output_truncated else [])
+            ),
         }
 
     registry.register(
@@ -310,6 +330,7 @@ def create_read_only_registry(
     )
 
     def list_files(arguments: dict[str, Any]) -> dict[str, Any]:
+        deadline = monotonic() + max_file_operation_duration_s
         raw_path = arguments.get("path", ".")
         base = policy.resolve_existing_path(raw_path)
         if not base.is_dir():
@@ -317,7 +338,10 @@ def create_read_only_registry(
         recursive = arguments.get("recursive", False)
         max_results = arguments.get("max_results", 500)
         files: list[dict[str, Any]] = []
-        for candidate in _iter_gitignore_visible_files(policy.root):
+        for candidate in _iter_gitignore_visible_files(
+            policy.root,
+            deadline=deadline,
+        ):
             try:
                 relative_to_base = candidate.relative_to(base)
             except ValueError:
@@ -331,7 +355,15 @@ def create_read_only_registry(
             files.append({"path": policy.display_path(candidate), "size": size})
             if len(files) > max_results:
                 break
-        truncated = len(files) > max_results
+        result_limit_reached = len(files) > max_results
+        time_limit_reached = _deadline_reached(deadline)
+        files.sort(key=lambda item: item["path"])
+        truncation_reasons = []
+        if result_limit_reached:
+            truncation_reasons.append("result_limit")
+        if time_limit_reached:
+            truncation_reasons.append("time_limit")
+        truncated = bool(truncation_reasons)
         files = files[:max_results]
         return {
             "path": policy.display_path(base),
@@ -339,6 +371,7 @@ def create_read_only_registry(
             "files": files,
             "count": len(files),
             "truncated": truncated,
+            "truncation_reasons": truncation_reasons,
             "gitignore_respected": True,
         }
 
@@ -374,6 +407,7 @@ def create_read_only_registry(
     )
 
     def glob_files(arguments: dict[str, Any]) -> dict[str, Any]:
+        deadline = monotonic() + max_file_operation_duration_s
         raw_path = arguments.get("path", ".")
         base = policy.resolve_existing_path(raw_path)
         if not base.is_dir():
@@ -383,7 +417,10 @@ def create_read_only_registry(
             raise ToolArgumentsError("glob patterns must not be empty")
         max_results = arguments.get("max_results", 500)
         matches: list[dict[str, Any]] = []
-        for candidate in _iter_gitignore_visible_files(policy.root):
+        for candidate in _iter_gitignore_visible_files(
+            policy.root,
+            deadline=deadline,
+        ):
             try:
                 relative = candidate.relative_to(base).as_posix()
             except ValueError:
@@ -397,7 +434,15 @@ def create_read_only_registry(
             matches.append({"path": policy.display_path(candidate), "size": size})
             if len(matches) > max_results:
                 break
-        truncated = len(matches) > max_results
+        result_limit_reached = len(matches) > max_results
+        time_limit_reached = _deadline_reached(deadline)
+        matches.sort(key=lambda item: item["path"])
+        truncation_reasons = []
+        if result_limit_reached:
+            truncation_reasons.append("result_limit")
+        if time_limit_reached:
+            truncation_reasons.append("time_limit")
+        truncated = bool(truncation_reasons)
         matches = matches[:max_results]
         return {
             "path": policy.display_path(base),
@@ -405,6 +450,7 @@ def create_read_only_registry(
             "files": matches,
             "count": len(matches),
             "truncated": truncated,
+            "truncation_reasons": truncation_reasons,
             "gitignore_respected": True,
         }
 
@@ -571,6 +617,7 @@ def create_read_only_registry(
     )
 
     def search_text(arguments: dict[str, Any]) -> dict[str, Any]:
+        search_deadline = monotonic() + max_search_duration_s
         query = arguments["query"]
         if not query:
             raise ToolArgumentsError("query must not be empty")
@@ -615,6 +662,7 @@ def create_read_only_registry(
                     max_results=max_results,
                     max_file_bytes=max_search_file_bytes,
                     max_output_chars=max_search_output_chars,
+                    timeout_s=max(0.001, search_deadline - monotonic()),
                 )
             except _RipgrepFallback as exc:
                 ripgrep_fallback_reason = exc.reason
@@ -631,6 +679,13 @@ def create_read_only_registry(
                     **ripgrep_result,
                 }
 
+        if regex:
+            raise ToolArgumentsError(
+                "regular expression search requires a working ripgrep backend; "
+                f"Python regex fallback is disabled because it cannot be safely "
+                f"time-bounded ({ripgrep_fallback_reason})"
+            )
+
         matches: list[dict[str, Any]] = []
         output_chars = 0
         output_limit_reached = False
@@ -641,8 +696,12 @@ def create_read_only_registry(
         skipped_outside_workspace = 0
         skipped_unreadable_files = 0
         truncated_files = 0
+        time_limit_reached = False
 
         for candidate in _iter_search_files(search_path):
+            if _deadline_reached(search_deadline):
+                time_limit_reached = True
+                break
             files_considered += 1
             try:
                 resolved = candidate.resolve(strict=True)
@@ -686,7 +745,13 @@ def create_read_only_registry(
             text = raw.decode("utf-8", errors="replace")
             lines = text.splitlines()
             for line_index, line in enumerate(lines):
+                if _deadline_reached(search_deadline):
+                    time_limit_reached = True
+                    break
                 for found in pattern.finditer(line):
+                    if _deadline_reached(search_deadline):
+                        time_limit_reached = True
+                        break
                     line_excerpt, excerpt_start = _line_excerpt(line, found.start())
                     matched_text = found.group(0)
                     match = {
@@ -714,9 +779,17 @@ def create_read_only_registry(
                     # Read one result beyond the limit so `truncated` is exact.
                     if len(matches) > max_results:
                         break
-                if len(matches) > max_results or output_limit_reached:
+                if (
+                    len(matches) > max_results
+                    or output_limit_reached
+                    or time_limit_reached
+                ):
                     break
-            if len(matches) > max_results or output_limit_reached:
+            if (
+                len(matches) > max_results
+                or output_limit_reached
+                or time_limit_reached
+            ):
                 break
 
         result_limit_reached = len(matches) > max_results
@@ -727,6 +800,8 @@ def create_read_only_registry(
             truncation_reasons.append("output_size_limit")
         if truncated_files:
             truncation_reasons.append("file_size_limit")
+        if time_limit_reached:
+            truncation_reasons.append("time_limit")
         truncated = bool(truncation_reasons)
         matches = matches[:max_results]
         return {
@@ -833,7 +908,10 @@ def create_workspace_registry(
     max_file_bytes: int = 64 * 1024,
     max_search_file_bytes: int = 1024 * 1024,
     max_search_output_chars: int = 128 * 1024,
+    max_search_duration_s: float = 30.0,
+    max_file_operation_duration_s: float = 30.0,
     max_write_bytes: int = 1024 * 1024,
+    max_delete_bytes: int = 64 * 1024 * 1024,
     max_command_output_chars: int = 64 * 1024,
     approval_policy: ApprovalPolicy | None = None,
     command_runner: ControlledCommandRunner | None = None,
@@ -843,11 +921,15 @@ def create_workspace_registry(
 
     if max_write_bytes < 1:
         raise ValueError("max_write_bytes must be >= 1")
+    if max_delete_bytes < 1:
+        raise ValueError("max_delete_bytes must be >= 1")
     registry = create_read_only_registry(
         workspace,
         max_file_bytes=max_file_bytes,
         max_search_file_bytes=max_search_file_bytes,
         max_search_output_chars=max_search_output_chars,
+        max_search_duration_s=max_search_duration_s,
+        max_file_operation_duration_s=max_file_operation_duration_s,
         approval_policy=approval_policy,
     )
     policy = WorkspacePolicy(Path(workspace))
@@ -1128,7 +1210,16 @@ def create_workspace_registry(
         if not path.is_file():
             raise ToolArgumentsError(f"path is not a regular file: {raw_path}")
 
-        digest = _sha256_file(path)
+        size = path.stat().st_size
+        if size > max_delete_bytes:
+            raise ToolArgumentsError(
+                f"file exceeds the {max_delete_bytes}-byte deletion limit"
+            )
+
+        digest = _sha256_file(
+            path,
+            deadline=monotonic() + max_file_operation_duration_s,
+        )
         expected_sha256 = arguments.get("expected_sha256")
         if expected_sha256 is not None:
             if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
@@ -1140,7 +1231,6 @@ def create_workspace_registry(
                     "file hash does not match expected_sha256; file was not deleted"
                 )
 
-        size = path.stat().st_size
         display_path = policy.display_path(path)
         path.unlink()
         return {
@@ -1281,6 +1371,7 @@ def create_workspace_registry(
             policy.root,
             kind=arguments.get("kind", "all"),
             timeout_s=arguments.get("timeout_s", 180),
+            total_timeout_s=arguments.get("total_timeout_s", 300),
         )
 
     registry.register(
@@ -1304,6 +1395,15 @@ def create_workspace_registry(
                         "minimum": 1,
                         "maximum": 300,
                         "description": "Per-command timeout (default: 180)",
+                    },
+                    "total_timeout_s": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 900,
+                        "description": (
+                            "Maximum wall-clock time for the full verification plan "
+                            "(default: 300)"
+                        ),
                     },
                 },
                 "additionalProperties": False,
@@ -1342,10 +1442,17 @@ def _atomic_write_bytes(path: Path, content: bytes, *, replace: bool) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path, *, deadline: float | None = None) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+        while True:
+            if deadline is not None and _deadline_reached(deadline):
+                raise ToolArgumentsError(
+                    "file hashing exceeded the operation time limit; file was not deleted"
+                )
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -1393,6 +1500,14 @@ class _RipgrepFallback(Exception):
         self.reason = reason
 
 
+class _SearchDeadlineExceeded(Exception):
+    """Signal that a bounded search used all of its wall-clock budget."""
+
+
+def _deadline_reached(deadline: float) -> bool:
+    return monotonic() >= deadline
+
+
 def _find_trusted_ripgrep(root: Path) -> tuple[str | None, str]:
     executable = shutil.which("rg")
     if executable is None:
@@ -1422,6 +1537,7 @@ def _search_text_with_ripgrep(
     max_results: int,
     max_file_bytes: int,
     max_output_chars: int,
+    timeout_s: float,
 ) -> dict[str, Any]:
     """Run ripgrep's JSON protocol while preserving the public search result shape."""
 
@@ -1471,10 +1587,11 @@ def _search_text_with_ripgrep(
     summary_searches: int | None = None
     matched_paths: set[str] = set()
     context_cache: dict[Path, list[str]] = {}
+    time_limit_reached = False
 
     assert process.stdout is not None
     try:
-        for raw_event in process.stdout:
+        for raw_event in _iter_ripgrep_lines(process, timeout_s=timeout_s):
             try:
                 event = json.loads(raw_event)
             except (json.JSONDecodeError, TypeError) as exc:
@@ -1556,6 +1673,10 @@ def _search_text_with_ripgrep(
                     break
             if stopped_early:
                 break
+    except _SearchDeadlineExceeded:
+        time_limit_reached = True
+        stopped_early = True
+        _stop_ripgrep(process)
     except _RipgrepFallback:
         _stop_ripgrep(process)
         raise
@@ -1575,6 +1696,8 @@ def _search_text_with_ripgrep(
         truncation_reasons.append("result_limit")
     if output_limit_reached:
         truncation_reasons.append("output_size_limit")
+    if time_limit_reached:
+        truncation_reasons.append("time_limit")
     matches = matches[:max_results]
     files_searched = summary_searches or len(matched_paths)
     return {
@@ -1590,6 +1713,60 @@ def _search_text_with_ripgrep(
         "truncated": bool(truncation_reasons),
         "truncation_reasons": truncation_reasons,
     }
+
+
+def _iter_ripgrep_lines(
+    process: subprocess.Popen[str], *, timeout_s: float
+) -> Iterator[str]:
+    """Yield process output without allowing a silent pipe to block forever."""
+
+    output_queue: Queue[Any] = Queue(maxsize=256)
+    sentinel = object()
+    stopped = Event()
+
+    def enqueue(item: Any) -> bool:
+        while not stopped.is_set():
+            try:
+                output_queue.put(item, timeout=0.1)
+                return True
+            except Full:
+                continue
+        return False
+
+    def read_stdout() -> None:
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                if not enqueue(line):
+                    return
+        except (OSError, ValueError):
+            # Terminating a timed-out process can close the pipe under this thread.
+            pass
+        finally:
+            enqueue(sentinel)
+
+    reader = Thread(
+        target=read_stdout,
+        name="coding-agent-ripgrep-reader",
+        daemon=True,
+    )
+    reader.start()
+    deadline = monotonic() + timeout_s
+    try:
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise _SearchDeadlineExceeded
+            try:
+                item = output_queue.get(timeout=remaining)
+            except Empty as exc:
+                raise _SearchDeadlineExceeded from exc
+            if item is sentinel:
+                return
+            yield item
+    finally:
+        stopped.set()
+        reader.join(timeout=0.1)
 
 
 def _decode_ripgrep_field(
@@ -1675,21 +1852,35 @@ def _iter_search_files(search_path: Path) -> Iterator[Path]:
             yield base / file_name
 
 
-def _iter_gitignore_visible_files(root: Path) -> Iterator[Path]:
+def _iter_gitignore_visible_files(
+    root: Path,
+    *,
+    deadline: float | None = None,
+) -> Iterator[Path]:
     """Yield tracked and non-ignored files, using Git as the source of truth."""
+
+    def remaining_timeout(cap: float) -> float:
+        if deadline is None:
+            return cap
+        return max(0.001, min(cap, deadline - monotonic()))
+
+    if deadline is not None and _deadline_reached(deadline):
+        return
 
     try:
         repository = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
             capture_output=True,
             check=False,
-            timeout=5,
+            timeout=remaining_timeout(5),
             text=True,
         )
     except (OSError, subprocess.SubprocessError):
         repository = None
 
     if repository is not None and repository.returncode == 0:
+        if deadline is not None and _deadline_reached(deadline):
+            return
         top_level = Path(repository.stdout.strip()).resolve()
         if top_level == root:
             try:
@@ -1706,12 +1897,14 @@ def _iter_gitignore_visible_files(root: Path) -> Iterator[Path]:
                     ],
                     capture_output=True,
                     check=False,
-                    timeout=15,
+                    timeout=remaining_timeout(15),
                 )
             except (OSError, subprocess.SubprocessError):
                 listed = None
             if listed is not None and listed.returncode == 0:
                 for raw_name in sorted(filter(None, listed.stdout.split(b"\0"))):
+                    if deadline is not None and _deadline_reached(deadline):
+                        return
                     try:
                         relative = raw_name.decode("utf-8", errors="surrogateescape")
                         candidate = (root / relative).resolve(strict=True)
@@ -1724,8 +1917,9 @@ def _iter_gitignore_visible_files(root: Path) -> Iterator[Path]:
 
     # A workspace need not itself be a Git repository. This fallback implements
     # the common .gitignore forms and applies nested files in declaration order.
-    fallback_candidates: list[Path] = []
     for directory, directory_names, file_names in os.walk(root, followlinks=False):
+        if deadline is not None and _deadline_reached(deadline):
+            return
         directory_names[:] = sorted(
             name
             for name in directory_names
@@ -1733,14 +1927,24 @@ def _iter_gitignore_visible_files(root: Path) -> Iterator[Path]:
         )
         base = Path(directory)
         for file_name in sorted(file_names):
+            if deadline is not None and _deadline_reached(deadline):
+                return
             candidate = base / file_name
-            if candidate.is_symlink() or _is_ignored_by_files(root, candidate):
+            if candidate.is_symlink() or _is_ignored_by_files(
+                root,
+                candidate,
+                deadline=deadline,
+            ):
                 continue
-            fallback_candidates.append(candidate)
-    yield from sorted(fallback_candidates, key=lambda item: item.relative_to(root).as_posix())
+            yield candidate
 
 
-def _is_ignored_by_files(root: Path, candidate: Path) -> bool:
+def _is_ignored_by_files(
+    root: Path,
+    candidate: Path,
+    *,
+    deadline: float | None = None,
+) -> bool:
     """Evaluate the common .gitignore pattern forms for the non-Git fallback."""
 
     ignored = False
@@ -1752,9 +1956,15 @@ def _is_ignored_by_files(root: Path, candidate: Path) -> bool:
         parents.append(current)
 
     for rule_base in parents:
+        if deadline is not None and _deadline_reached(deadline):
+            return True
         ignore_file = rule_base / ".gitignore"
         try:
-            lines = ignore_file.read_text(encoding="utf-8").splitlines()
+            with ignore_file.open("rb") as stream:
+                raw_rules = stream.read(1024 * 1024 + 1)
+            if len(raw_rules) > 1024 * 1024:
+                continue
+            lines = raw_rules.decode("utf-8").splitlines()
         except (OSError, UnicodeDecodeError):
             continue
         relative = candidate.relative_to(rule_base).as_posix()

@@ -197,6 +197,32 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("private-details.py", rendered)
             self.assertNotIn("hidden", rendered)
 
+    async def test_activity_shows_live_model_and_tool_progress(self) -> None:
+        app = self.make_app()
+
+        async with app.run_test(size=(100, 32)):
+            app.post_agent_event(
+                "model_request_started",
+                {"step": 2, "max_steps": 30, "finalizing": False},
+            )
+            activity = str(app.query_one("#activity", Static).render())
+            self.assertIn("Model step 2/30", activity)
+            self.assertIn("waiting for model", activity)
+
+            assert app._activity_started_at is not None
+            app._activity_started_at -= 65
+            app._refresh_activity_elapsed()
+            activity = str(app.query_one("#activity", Static).render())
+            self.assertIn("1m 05s elapsed", activity)
+
+            app.post_agent_event(
+                "tool_started",
+                {"step": 2, "name": "run_command"},
+            )
+            activity = str(app.query_one("#activity", Static).render())
+            self.assertIn("Model step 2", activity)
+            self.assertIn("Running command", activity)
+
     async def test_copies_latest_raw_agent_response(self) -> None:
         app = self.make_app()
         answer = "Use this code:\n\n```python\nprint('hello')\n```"
@@ -321,6 +347,34 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(approval_stub)
             self.assertTrue(approval_stub.approved)
             self.assertFalse(app.busy)
+
+    async def test_agent_denies_approval_after_tui_timeout(self) -> None:
+        approval_stub: ApprovalStubAgent | None = None
+
+        def factory(events: Any, approval: Any) -> ApprovalStubAgent:
+            nonlocal approval_stub
+            approval_stub = ApprovalStubAgent(events, approval)
+            return approval_stub
+
+        app = CodingAgentApp(
+            agent_factory=factory,  # type: ignore[arg-type]
+            workspace=self.workspace,
+            model_name="fake-model",
+            approval_mode="ask",
+            approval_timeout_s=0.02,
+        )
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            app.submit_prompt("Run tests")
+            for _ in range(200):
+                await pilot.pause(0.01)
+                if not app.busy:
+                    break
+
+            self.assertIsNotNone(approval_stub)
+            self.assertFalse(approval_stub.approved)
+            self.assertFalse(app.busy)
+            self.assertNotIsInstance(app.screen, ApprovalScreen)
 
     async def test_local_new_command_resets_session(self) -> None:
         app = self.make_app()

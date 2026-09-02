@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from coding_agent.agent import Agent, AgentConfig, AgentStatus
+from coding_agent.agent import Agent, AgentConfig, AgentStatus, VerificationMode
 from coding_agent.conversation import Message
 from coding_agent.errors import (
     ModelRequestError,
@@ -138,7 +138,12 @@ class AgentLoopTests(unittest.TestCase):
                 ModelResponse.from_parts(text="This is a tiny example project."),
             ]
         )
-        agent = Agent(model=model, tools=create_read_only_registry(self.workspace))
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            events=events,
+        )
 
         result = agent.run("Read README.md and describe the project")
 
@@ -154,6 +159,228 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(tool_message["role"], "tool")
         self.assertEqual(tool_message["tool_call_id"], "call-1")
         self.assertIn("A tiny project", tool_message["content"])
+        self.assertEqual(
+            [event_type for event_type, _ in events.events],
+            [
+                "user_message",
+                "model_request_started",
+                "model_response",
+                "tool_started",
+                "tool_result",
+                "model_request_started",
+                "model_response",
+                "agent_terminated",
+            ],
+        )
+
+    def test_completion_gate_finishes_early_with_successful_evidence(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="read-1",
+                            name="read_file",
+                            arguments={"path": "README.md"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish-1",
+                            name="finish_task",
+                            arguments={
+                                "summary": "README.md was inspected.",
+                                "evidence_tool_call_ids": ["read-1"],
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            events=events,
+        )
+
+        result = agent.run("Inspect README.md")
+
+        self.assertEqual(result.status, AgentStatus.COMPLETED)
+        self.assertEqual(result.termination_reason, "completion_gate")
+        self.assertEqual(result.steps, 2)
+        self.assertEqual(result.text, "README.md was inspected.")
+        self.assertIn(
+            "finish_task",
+            [schema["function"]["name"] for schema in model.tool_requests[0]],
+        )
+        self.assertTrue(
+            any(
+                event_type == "completion_gate" and payload["accepted"] is True
+                for event_type, payload in events.events
+            )
+        )
+
+    def test_completion_gate_requires_verified_workspace_change(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish-1",
+                            name="finish_task",
+                            arguments={
+                                "summary": "Changed the project.",
+                                "evidence_tool_call_ids": ["change-1"],
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="verify-1",
+                            name="verify_project",
+                            arguments={"kind": "all"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish-2",
+                            name="finish_task",
+                            arguments={
+                                "summary": "Changed and verified the project.",
+                                "evidence_tool_call_ids": ["change-1", "verify-1"],
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry([{"ok": True, "results": []}]),
+            events=events,
+        )
+
+        result = agent.run("Change the project")
+
+        self.assertEqual(result.status, AgentStatus.COMPLETED)
+        self.assertEqual(result.termination_reason, "completion_gate")
+        self.assertEqual(result.steps, 4)
+        completion_events = [
+            payload for event_type, payload in events.events if event_type == "completion_gate"
+        ]
+        self.assertEqual([payload["accepted"] for payload in completion_events], [False, True])
+        self.assertIn("verification is still required", str(completion_events[0]["error"]))
+
+    def test_completion_gate_allows_explicitly_unverified_available_mode(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="verify-1",
+                            name="verify_project",
+                            arguments={"kind": "all"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish-1",
+                            name="finish_task",
+                            arguments={
+                                "summary": "Changed the project.",
+                                "evidence_tool_call_ids": ["change-1", "verify-1"],
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry(
+                [
+                    {
+                        "ok": False,
+                        "skipped": True,
+                        "skip_reason": (
+                            "no configured verification command was detected"
+                        ),
+                        "results": [],
+                    }
+                ]
+            ),
+        )
+
+        result = agent.run("Change the project")
+
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.termination_reason, "completion_gate")
+        self.assertIn("Verification: project changes are unverified", result.text)
+
+    def test_persisted_completion_gate_finishes_early(self) -> None:
+        store = SqliteConversationStore(
+            self.workspace / ".coding-agent" / "history.sqlite3"
+        )
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="read-1",
+                            name="read_file",
+                            arguments={"path": "README.md"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish-1",
+                            name="finish_task",
+                            arguments={
+                                "summary": "README.md was inspected.",
+                                "evidence_tool_call_ids": ["read-1"],
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+        agent = Agent(
+            model=model,
+            tools=create_read_only_registry(self.workspace),
+            store=store,
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        result = agent.run("Inspect README.md")
+
+        self.assertEqual(result.status, AgentStatus.COMPLETED)
+        self.assertEqual(result.termination_reason, "completion_gate")
+        self.assertEqual(result.steps, 2)
+        assert result.session_id is not None
+        self.assertEqual(store.get_session(result.session_id).status, "completed")
 
     def test_each_agent_run_starts_a_new_approval_task(self) -> None:
         class TaskAwarePolicy:
@@ -294,6 +521,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.termination_reason, "max_steps")
         self.assertEqual(model.tool_requests[1], [])
         self.assertEqual(model.requests[1][-1]["name"], "verify_project")
+        self.assertEqual(model.requests[1][-2]["reasoning_content"], "")
         verification_result = json.loads(model.requests[1][-1]["content"])
         self.assertTrue(verification_result["output"]["ok"])
         self.assertIn("verification passed", model.requests[1][0]["content"])
@@ -383,6 +611,251 @@ class AgentLoopTests(unittest.TestCase):
                 for event_type, payload in events.events
             )
         )
+
+    def test_available_mode_finishes_unverified_when_no_check_is_configured(
+        self,
+    ) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(text="Premature verified claim."),
+                ModelResponse.from_parts(
+                    text="Changes are complete, but no verification was configured."
+                ),
+            ]
+        )
+        events = RecordingEventSink()
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry(
+                [
+                    {
+                        "ok": False,
+                        "skipped": True,
+                        "skip_reason": (
+                            "no configured verification command was detected"
+                        ),
+                        "results": [],
+                    }
+                ]
+            ),
+            events=events,
+        )
+
+        result = agent.run("Change the project")
+
+        self.assertEqual(result.status, AgentStatus.PARTIAL)
+        self.assertEqual(result.termination_reason, "final_response")
+        self.assertEqual(
+            result.text,
+            "Changes are complete, but no verification was configured.",
+        )
+        self.assertNotIn(
+            "Premature verified claim.",
+            [
+                message.get("content")
+                for message in result.conversation.messages
+                if message["role"] == "assistant"
+            ],
+        )
+        self.assertTrue(
+            any(
+                event_type == "verification_skipped"
+                and payload["reason"] == "verification_unconfigured"
+                for event_type, payload in events.events
+            )
+        )
+
+    def test_available_mode_keeps_read_only_manual_verification_completed(
+        self,
+    ) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(
+                            id="manual-verify",
+                            name="verify_project",
+                            arguments={"kind": "all"},
+                        )
+                    ]
+                ),
+                ModelResponse.from_parts(text="Read-only handoff."),
+            ]
+        )
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry(
+                [
+                    {
+                        "ok": False,
+                        "skipped": True,
+                        "skip_reason": (
+                            "no configured verification command was detected"
+                        ),
+                        "results": [],
+                    }
+                ]
+            ),
+            config=AgentConfig(max_steps=3),
+        )
+
+        result = agent.run("Inspect the project")
+
+        self.assertEqual(result.status, AgentStatus.COMPLETED)
+        self.assertEqual(result.termination_reason, "final_response")
+
+    def test_persisted_available_manual_verification_stays_completed(self) -> None:
+        store = SqliteConversationStore(
+            self.workspace / ".coding-agent" / "history.sqlite3"
+        )
+        first_agent = Agent(
+            model=FakeModel(
+                [
+                    ModelResponse.from_parts(
+                        tool_calls=[
+                            ToolCall(
+                                id="manual-verify",
+                                name="verify_project",
+                                arguments={"kind": "all"},
+                            )
+                        ]
+                    ),
+                    ModelResponse.from_parts(text="Read-only handoff."),
+                ]
+            ),
+            tools=create_verification_registry(
+                [
+                    {
+                        "ok": False,
+                        "skipped": True,
+                        "skip_reason": (
+                            "no configured verification command was detected"
+                        ),
+                        "results": [],
+                    }
+                ]
+            ),
+            config=AgentConfig(max_steps=3),
+            store=store,
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        first_result = first_agent.run("Inspect the project")
+
+        self.assertEqual(first_result.status, AgentStatus.COMPLETED)
+        assert first_result.session_id is not None
+
+        resumed_agent = Agent(
+            model=FakeModel([ModelResponse.from_parts(text="Still read-only.")]),
+            tools=create_verification_registry([]),
+            store=store,
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+        resumed_result = resumed_agent.run(
+            "Summarize the current state",
+            session_id=first_result.session_id,
+        )
+
+        self.assertEqual(resumed_result.status, AgentStatus.COMPLETED)
+
+    def test_persisted_available_mode_restores_unverified_state(self) -> None:
+        store = SqliteConversationStore(
+            self.workspace / ".coding-agent" / "history.sqlite3"
+        )
+        first_model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(text="Provisional answer."),
+                ModelResponse.from_parts(text="Unverified handoff."),
+            ]
+        )
+        first_agent = Agent(
+            model=first_model,
+            tools=create_verification_registry(
+                [
+                    {
+                        "ok": False,
+                        "skipped": True,
+                        "skip_reason": (
+                            "no configured verification command was detected"
+                        ),
+                        "results": [],
+                    }
+                ]
+            ),
+            store=store,
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        first_result = first_agent.run("Change the project")
+
+        self.assertEqual(first_result.status, AgentStatus.PARTIAL)
+        assert first_result.session_id is not None
+        self.assertEqual(store.get_session(first_result.session_id).status, "partial")
+
+        resumed_model = FakeModel([ModelResponse.from_parts(text="Still unverified.")])
+        resumed_agent = Agent(
+            model=resumed_model,
+            tools=create_verification_registry([]),
+            store=store,
+            workspace=self.workspace,
+            model_name="fake-model",
+        )
+
+        resumed_result = resumed_agent.run(
+            "Summarize the current state",
+            session_id=first_result.session_id,
+        )
+
+        self.assertEqual(resumed_result.status, AgentStatus.PARTIAL)
+        self.assertEqual(resumed_result.text, "Still unverified.")
+        self.assertEqual(len(resumed_model.requests), 1)
+
+    def test_strict_mode_rejects_unconfigured_verification(self) -> None:
+        model = FakeModel(
+            [
+                ModelResponse.from_parts(
+                    tool_calls=[
+                        ToolCall(id="change-1", name="change_file", arguments={})
+                    ]
+                ),
+                ModelResponse.from_parts(text="Must not be accepted."),
+            ]
+        )
+        agent = Agent(
+            model=model,
+            tools=create_verification_registry(
+                [
+                    {
+                        "ok": False,
+                        "skipped": True,
+                        "skip_reason": (
+                            "no configured verification command was detected"
+                        ),
+                        "results": [],
+                    }
+                ]
+            ),
+            config=AgentConfig(verification_mode=VerificationMode.STRICT),
+        )
+
+        with self.assertRaisesRegex(
+            VerificationRequiredError,
+            "no configured verification command was detected",
+        ):
+            agent.run("Change the project")
 
     def test_verification_unavailable_raises_instead_of_accepting_final(self) -> None:
         registry = ToolRegistry()
@@ -493,6 +966,51 @@ class AgentLoopTests(unittest.TestCase):
         self.assertTrue(model.tool_requests[0])
         self.assertEqual(model.tool_requests[1], [])
         self.assertIn("maximum model steps", model.requests[1][0]["content"])
+
+    def test_finalization_falls_back_when_model_cannot_return_text(self) -> None:
+        for final_response in (
+            ModelResponse.from_parts(
+                tool_calls=[
+                    ToolCall(id="unexpected-tool", name="read_file", arguments={})
+                ]
+            ),
+            ModelRequestError("final model request failed", retryable=False),
+        ):
+            with self.subTest(final_response=type(final_response).__name__):
+                model = FakeModel(
+                    [
+                        ModelResponse.from_parts(
+                            tool_calls=[
+                                ToolCall(
+                                    id="read-1",
+                                    name="read_file",
+                                    arguments={"path": "README.md"},
+                                )
+                            ]
+                        ),
+                        final_response,
+                    ]
+                )
+                events = RecordingEventSink()
+                agent = Agent(
+                    model=model,
+                    tools=create_read_only_registry(self.workspace),
+                    config=AgentConfig(max_steps=2),
+                    events=events,
+                )
+
+                result = agent.run("Inspect README.md")
+
+                self.assertEqual(result.status, AgentStatus.PARTIAL)
+                self.assertEqual(result.termination_reason, "max_steps")
+                self.assertIn("could not generate its normal text-only handoff", result.text)
+                self.assertEqual(model.tool_requests[-1], [])
+                self.assertTrue(
+                    any(
+                        event_type == "finalization_fallback"
+                        for event_type, _ in events.events
+                    )
+                )
 
     def test_persisted_max_steps_records_partial_session_status(self) -> None:
         model = FakeModel(
@@ -626,6 +1144,63 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.status, AgentStatus.PARTIAL)
         self.assertEqual(result.steps, 7)
 
+    def test_cycle_termination_preserves_verification_mode(self) -> None:
+        for mode, expected_status in (
+            (VerificationMode.AVAILABLE, AgentStatus.PARTIAL),
+            (VerificationMode.STRICT, AgentStatus.BLOCKED),
+        ):
+            with self.subTest(mode=mode):
+                model = FakeModel(
+                    [
+                        ModelResponse.from_parts(
+                            tool_calls=[
+                                ToolCall(
+                                    id="change-1",
+                                    name="change_file",
+                                    arguments={},
+                                )
+                            ]
+                        ),
+                        ModelResponse.from_parts(
+                            tool_calls=[
+                                ToolCall(
+                                    id="change-2",
+                                    name="change_file",
+                                    arguments={},
+                                )
+                            ]
+                        ),
+                        ModelResponse.from_parts(text="Cycle handoff."),
+                    ]
+                )
+                agent = Agent(
+                    model=model,
+                    tools=create_verification_registry(
+                        [
+                            {
+                                "ok": False,
+                                "skipped": True,
+                                "skip_reason": (
+                                    "no configured verification command was detected"
+                                ),
+                                "results": [],
+                            }
+                        ]
+                    ),
+                    config=AgentConfig(
+                        max_steps=5,
+                        repeated_tool_call_limit=1,
+                        verification_mode=mode,
+                    ),
+                )
+
+                result = agent.run("Change the project until the loop stops")
+
+                self.assertEqual(result.termination_reason, "no_progress")
+                self.assertEqual(result.status, expected_status)
+                self.assertEqual(result.steps, 3)
+                self.assertEqual(model.tool_requests[-1], [])
+
     def test_jsonl_event_log_records_termination(self) -> None:
         log_path = self.workspace / ".coding-agent" / "events.jsonl"
         model = FakeModel(
@@ -649,10 +1224,15 @@ class AgentLoopTests(unittest.TestCase):
         events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(
             [event["type"] for event in events],
-            ["user_message", "model_response", "agent_terminated"],
+            [
+                "user_message",
+                "model_request_started",
+                "model_response",
+                "agent_terminated",
+            ],
         )
         self.assertEqual(events[-1]["payload"]["reason"], "final_response")
-        model_event = events[1]["payload"]
+        model_event = events[2]["payload"]
         self.assertEqual(model_event["finish_reason"], "stop")
         self.assertEqual(model_event["usage"]["prompt_tokens"], 7)
         self.assertEqual(model_event["response_id"], "response-test")

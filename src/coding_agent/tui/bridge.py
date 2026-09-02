@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -29,8 +29,16 @@ class TuiEventSink:
 class TuiApprovalPolicy(ApprovalPolicy):
     """Block the agent worker while Textual presents an approval modal."""
 
-    def __init__(self, app: CodingAgentApp) -> None:
+    def __init__(
+        self,
+        app: CodingAgentApp,
+        *,
+        timeout_s: float = 300,
+    ) -> None:
+        if timeout_s <= 0:
+            raise ValueError("approval timeout must be positive")
         self._app = app
+        self._timeout_s = timeout_s
         self._pending: set[Future[ApprovalDecision]] = set()
         self._lock = Lock()
 
@@ -44,7 +52,15 @@ class TuiApprovalPolicy(ApprovalPolicy):
             future,
         )
         try:
-            return future.result()
+            return future.result(timeout=self._timeout_s)
+        except FutureTimeoutError:
+            if not future.done():
+                future.set_result(ApprovalDecision.DENY)
+            self._app.call_from_thread(
+                self._app.expire_approval,
+                request,
+            )
+            return ApprovalDecision.DENY
         finally:
             with self._lock:
                 self._pending.discard(future)

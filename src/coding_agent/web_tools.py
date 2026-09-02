@@ -10,7 +10,10 @@ import socket
 import ssl
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Callable, Mapping
+from queue import Empty, Queue
+from threading import Thread
+from time import monotonic
+from typing import Any, Callable, Mapping
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 from .errors import WebAccessError
@@ -250,9 +253,17 @@ class WebAccessClient:
         body: bytes | None,
         follow_redirects: bool,
     ) -> tuple[HttpResponse, str]:
+        deadline = monotonic() + self._timeout_s
         current_url = url
         for redirect_count in range(self._max_redirects + 1):
-            target = _resolve_https_target(current_url, self._resolver)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise WebAccessError("web request exceeded the total time limit")
+            target = _resolve_https_target(
+                current_url,
+                self._resolver,
+                timeout_s=remaining,
+            )
             request_headers = {
                 "Accept-Encoding": "identity",
                 "Connection": "close",
@@ -260,13 +271,22 @@ class WebAccessClient:
                 **headers,
             }
             try:
-                response = self._transport(
-                    target,
-                    method,
-                    request_headers,
-                    body,
-                    self._timeout_s,
-                    self._max_response_bytes,
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise WebAccessError(
+                        "web request exceeded the total time limit"
+                    )
+                response = _call_with_timeout(
+                    lambda: self._transport(
+                        target,
+                        method,
+                        request_headers,
+                        body,
+                        remaining,
+                        self._max_response_bytes,
+                    ),
+                    timeout_s=remaining,
+                    operation="HTTPS request",
                 )
             except WebAccessError:
                 raise
@@ -330,6 +350,7 @@ def _https_transport(
     timeout_s: float,
     max_bytes: int,
 ) -> HttpResponse:
+    deadline = monotonic() + timeout_s
     connection = _PinnedHTTPSConnection(target, timeout=timeout_s)
     try:
         connection.request(
@@ -338,19 +359,68 @@ def _https_transport(
             body=body,
             headers=dict(headers),
         )
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise WebAccessError("HTTPS request exceeded the total time limit")
+        if connection.sock is not None:
+            connection.sock.settimeout(remaining)
         response = connection.getresponse()
-        body = response.read(max_bytes + 1)
-        truncated = len(body) > max_bytes
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while bytes_read <= max_bytes:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise WebAccessError("HTTPS response exceeded the total time limit")
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining)
+            chunk = response.read(min(64 * 1024, max_bytes + 1 - bytes_read))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        response_body = b"".join(chunks)
+        truncated = len(response_body) > max_bytes
         if truncated:
-            body = body[:max_bytes]
+            response_body = response_body[:max_bytes]
         return HttpResponse(
             status=response.status,
             headers={key.casefold(): value for key, value in response.getheaders()},
-            body=body,
+            body=response_body,
             truncated=truncated,
         )
     finally:
         connection.close()
+
+
+def _call_with_timeout(
+    operation_fn: Callable[[], Any],
+    *,
+    timeout_s: float,
+    operation: str,
+) -> Any:
+    """Run read-only network work on a daemon thread with a hard caller deadline."""
+
+    results: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            results.put((True, operation_fn()))
+        except Exception as exc:
+            results.put((False, exc))
+
+    Thread(
+        target=invoke,
+        name=f"coding-agent-{operation.casefold().replace(' ', '-')}",
+        daemon=True,
+    ).start()
+    try:
+        ok, value = results.get(timeout=max(0.001, timeout_s))
+    except Empty as exc:
+        raise WebAccessError(f"{operation} exceeded the total time limit") from exc
+    if not ok:
+        assert isinstance(value, Exception)
+        raise value
+    return value
 
 
 def _parse_exa_mcp_response(body: str) -> str:
@@ -414,7 +484,12 @@ def _resolve_addresses(hostname: str, port: int) -> list[str]:
     return [record[4][0] for record in records]
 
 
-def _resolve_https_target(url: str, resolver: Resolver) -> ResolvedHttpsTarget:
+def _resolve_https_target(
+    url: str,
+    resolver: Resolver,
+    *,
+    timeout_s: float,
+) -> ResolvedHttpsTarget:
     if not isinstance(url, str) or not url.strip():
         raise WebAccessError("web URL must be a non-empty string")
     candidate = url.strip()
@@ -447,7 +522,11 @@ def _resolve_https_target(url: str, resolver: Resolver) -> ResolvedHttpsTarget:
         pass
     else:
         raise WebAccessError("web URLs must use a public DNS hostname, not an IP literal")
-    addresses = resolver(hostname, 443)
+    addresses = _call_with_timeout(
+        lambda: resolver(hostname, 443),
+        timeout_s=timeout_s,
+        operation="DNS resolution",
+    )
     if not addresses:
         raise WebAccessError("web hostname resolved to no addresses")
     public_addresses: list[str] = []

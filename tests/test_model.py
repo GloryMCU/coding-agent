@@ -103,6 +103,54 @@ class OpenAIMessageParserTests(unittest.TestCase):
         self.assertEqual(response.response_id, "response-1")
         self.assertEqual(response.usage["total_tokens"], 15)
 
+    def test_deepseek_client_backfills_reasoning_for_tool_call_history(self) -> None:
+        captured_request: dict[str, object] = {}
+
+        class FakeCompletions:
+            def create(self, **request: object) -> SimpleNamespace:
+                captured_request.update(request)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content="Done",
+                                reasoning_content="final reasoning",
+                                tool_calls=None,
+                            ),
+                            finish_reason="stop",
+                        )
+                    ]
+                )
+
+        fake_module = SimpleNamespace(
+            OpenAI=lambda **kwargs: SimpleNamespace(
+                chat=SimpleNamespace(completions=FakeCompletions())
+            )
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "verify-1",
+                        "type": "function",
+                        "function": {
+                            "name": "verify_project",
+                            "arguments": '{"kind":"all"}',
+                        },
+                    }
+                ],
+            }
+        ]
+        with patch.dict(sys.modules, {"openai": fake_module}):
+            client = DeepSeekV4ProClient(api_key="test-key")
+            client.generate(messages, [], timeout_s=12)
+
+        sent_messages = captured_request["messages"]
+        self.assertEqual(sent_messages[0]["reasoning_content"], "")
+        self.assertNotIn("reasoning_content", messages[0])
+
     def test_client_rejects_truncated_response(self) -> None:
         class FakeCompletions:
             def create(self, **request: object) -> SimpleNamespace:

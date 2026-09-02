@@ -28,6 +28,8 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.context_summary_tokens, 8_192)
         self.assertEqual(args.history_search_limit, 5)
         self.assertEqual(args.approval_mode, "workspace")
+        self.assertEqual(args.approval_timeout_s, 300.0)
+        self.assertEqual(args.verification_mode, "available")
         self.assertEqual(args.sandbox, "required")
         self.assertEqual(args.sandbox_runtime, "auto")
         self.assertIsNone(args.sandbox_image)
@@ -84,6 +86,20 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(args.model_timeout_s, 180.0)
         self.assertEqual(args.max_model_retries, 5)
         self.assertEqual(args.retry_base_delay_s, 1.5)
+
+    def test_approval_timeout_can_be_configured(self) -> None:
+        args = build_parser().parse_args(
+            ["--approval-timeout-s", "45", "Inspect README.md"]
+        )
+
+        self.assertEqual(args.approval_timeout_s, 45.0)
+
+    def test_strict_verification_mode_can_be_selected(self) -> None:
+        args = build_parser().parse_args(
+            ["--verification-mode", "strict", "Inspect README.md"]
+        )
+
+        self.assertEqual(args.verification_mode, "strict")
 
 
 class PlainCliTests(unittest.TestCase):

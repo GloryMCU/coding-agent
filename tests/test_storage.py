@@ -138,6 +138,27 @@ class SqliteConversationStoreTests(unittest.TestCase):
         self.assertEqual(messages[2]["tool_calls"][0]["id"], "call-1")
         self.assertIn("Durable project", messages[3]["content"])
 
+    def test_round_trip_preserves_empty_reasoning_field_for_tool_calls(self) -> None:
+        store, session_id = self.create_store_and_session()
+        store.append_user(session_id, "verify the project")
+        store.append_assistant(
+            session_id,
+            ModelResponse.from_parts(
+                reasoning_content="",
+                tool_calls=[
+                    ToolCall(
+                        id="verify-1",
+                        name="verify_project",
+                        arguments={"kind": "all"},
+                    )
+                ],
+            ),
+        )
+
+        messages = ContextBuilder(store).build(session_id)
+
+        self.assertEqual(messages[-2]["reasoning_content"], "")
+
     def test_completed_tool_call_is_not_executed_twice(self) -> None:
         store, session_id = self.create_store_and_session()
         store.append_assistant(

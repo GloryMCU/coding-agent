@@ -192,6 +192,29 @@ class DeepSeekV4ProClient(OpenAIChatClient):
                 "thinking": {"type": "enabled" if thinking else "disabled"}
             },
         )
+        self._thinking = thinking
+
+    def generate(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        *,
+        timeout_s: float,
+    ) -> ModelResponse:
+        if self._thinking:
+            # DeepSeek requires reasoning_content to be passed back for every
+            # assistant tool-call message.  Backfill an empty value for
+            # agent-synthesized and legacy stored messages while preserving
+            # any reasoning that actually came from the model.
+            messages = deepcopy(messages)
+            for message in messages:
+                if (
+                    message.get("role") == "assistant"
+                    and message.get("tool_calls")
+                    and "reasoning_content" not in message
+                ):
+                    message["reasoning_content"] = ""
+        return super().generate(messages, tools, timeout_s=timeout_s)
 
 
 def parse_openai_message(

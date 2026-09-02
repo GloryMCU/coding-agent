@@ -146,6 +146,8 @@ coding-agent --history-search-limit 8 --workspace . "回顾之前的数据库决
 coding-agent --max-steps 50 --workspace . "执行特别长的重构任务"
 coding-agent --approval-mode deny --workspace . "只读分析这个仓库"
 coding-agent --approval-mode ask --workspace . "逐项审查这个不可信仓库"
+coding-agent --approval-timeout-s 300 --workspace . "运行需要审批的任务"
+coding-agent --verification-mode strict --workspace . "执行 CI 级严格验证"
 coding-agent --approval-mode allow --workspace . "运行测试并修复失败"
 coding-agent --sandbox-image coding-agent-sandbox:python --workspace . "运行测试"
 coding-agent --model-timeout-s 180 --max-model-retries 5 `
@@ -185,6 +187,7 @@ CLI 审批提示和 TUI 弹窗均支持“允许一次”与“本任务内允�
 `Agent.run()` 开始时自动清空。权限规则可以同时按操作类型、工具名、资源 glob、命令
 前缀和沙箱状态匹配；冲突时固定采用 `deny > ask > allow`，因此宽泛允许规则不能覆盖
 更具体的拒绝或询问规则。
+TUI 审批默认等待 300 秒，超时后自动拒绝；可用 `--approval-timeout-s` 调整。
 
 ## 交互式终端界面
 
@@ -194,7 +197,7 @@ CLI 审批提示和 TUI 弹窗均支持“允许一次”与“本任务内允�
 Header：coding-agent 与时钟
 Context：workspace、model、approval、session
 Conversation：用户消息、Markdown 回答、reasoning 摘要、工具状态
-Activity：当前运行阶段
+Activity：模型轮次、当前工具和该阶段已用时间
 Prompt：多行任务编辑器
 Footer：快捷键
 ```
@@ -212,8 +215,10 @@ Footer：快捷键
 
 同步的 `Agent.run` 在 Textual 线程 Worker 中执行，模型和工具事件通过
 `TuiEventSink` 回到 UI 线程；`TuiApprovalPolicy` 只阻塞 Agent Worker，并用 Future
-等待审批弹窗。审计事件仍同时写入 JSONL。这个桥接层接受任意字符串事件类型，后续
-加入 `text_delta`、`tool_output_delta` 和取消事件时无需重写页面启动逻辑。
+等待审批弹窗。每次模型请求和工具执行都会先发送 started 事件，因此等待完整响应期间
+状态栏仍会显示当前模型轮次、工具名称和持续时间。审计事件仍同时写入 JSONL。这个桥接
+层接受任意字符串事件类型，后续加入 `text_delta`、`tool_output_delta` 和取消事件时无需
+重写页面启动逻辑。
 
 思考模式产生工具调用时，适配器会把 DeepSeek 返回的 `reasoning_content`
 原样保存在 assistant 消息中，并在下一轮请求中带回。Agent 不解析或执行其中内容。
@@ -248,15 +253,22 @@ python -m coding_agent --workspace . "读取 README.md"
 
 `search_text` 会自动探测 PATH 中位于工作区外的 `rg`，优先通过 ripgrep 的 JSON 协议执行搜索，
 因此大型 Git 工作区能够利用并行遍历、`.gitignore` 和 ripgrep 的高性能匹配；参数
-校验、路径沙箱、文件大小及结果大小上限仍由 Python 层控制。如果未安装 ripgrep、
-启动失败，或 Python 正则包含 ripgrep 不支持的语法，工具会自动回退到原有 Python
-实现。结果中的 `search_backend` 表示实际后端；ripgrep 无法提供逐类跳过文件计数时，
+校验、路径沙箱、文件大小及结果大小上限仍由 Python 层控制。如果未安装 ripgrep 或
+启动失败，字面量搜索会自动回退到 Python 实现。正则搜索必须使用 ripgrep；不支持的
+正则会返回可操作错误，不再回退到无法安全中断的 Python 正则引擎。结果中的
+`search_backend` 表示实际后端；ripgrep 无法提供逐类跳过文件计数时，
 `search_statistics_complete` 为 `false`，这些分类计数保守返回 `0`。
+两种后端共享默认 30 秒的总搜索时限；达到时限后会终止 ripgrep 或停止 Python 遍历，
+返回已经找到的部分结果，并在 `truncation_reasons` 中包含 `time_limit`，避免 TUI 因
+磁盘、目录或子进程异常而无限停留在 `Searching code`。
 
 文件发现使用两个独立工具：
 
 - `list_files` 列出目录的直接文件或全部后代，返回相对路径和字节数；
 - `glob_files` 用一到多个 glob 筛选递归文件集合。
+
+`read_file`、`list_files` 和 `glob_files` 共享默认 30 秒文件操作时限。达到时限时读取或
+枚举会返回已有部分结果，并用 `truncation_reasons=["time_limit"]` 明确标记。
 
 在 Git 工作区中，两者使用 `git ls-files --cached --others --exclude-standard`
 作为可见文件的事实来源，因此同时支持根目录和嵌套 `.gitignore`、全局 excludes，
@@ -275,6 +287,8 @@ Key、Token、密码和任意自定义环境变量；超时会终止为该命令
 PowerShell 时必须显式使用 `powershell` 或 `pwsh`，并且删除、下载、动态执行等
 高风险 cmdlet 会在审批前直接拒绝。通过 `run_command` 调用的 Git 也会拒绝写操作
 和网络操作。
+命令超时后的进程树终止和输出回收还有独立的 5 秒清理截止；清理未完全结束时结果会
+设置 `cleanup_incomplete=true`，不会再次无限阻塞 Agent Worker。
 
 CLI 默认把 `run_command` 与 `verify_project` 放入 Docker/Podman Linux 容器执行：
 
@@ -318,17 +332,24 @@ cwd = "src"
 Python 自动发现不再仅因存在 `pyproject.toml` 就假定已安装 `python -m build`；需要
 构建检查的仓库应在显式配置中声明。
 
-验证类别是 `test`、`build`、`format_check` 或 `all`。格式化只使用检查模式，不会
+验证类别是 `test`、`build`、`format_check` 或 `all`。每条命令默认最多 180 秒，整个
+验证计划默认最多 300 秒，可分别用 `timeout_s` 和 `total_timeout_s` 调整。格式化只使用检查模式，不会
 自动重写源文件；未检测到相应配置时通过 `skipped_checks` 明确报告，`complete` 也会
 保持为 false。每次验证计划作为一个完整权限操作处理；默认 `workspace` 模式会自动
 执行沙箱内验证，`ask` 模式仍会请求用户审批。
 
+验证门禁默认使用 `--verification-mode available`：发现验证命令时仍必须执行并通过；
+仓库完全没有可用验证命令时不再抛出异常终止，而是让模型基于明确的未验证状态完成
+交接，任务状态记为 `partial`。CI 或高风险仓库可使用 `--verification-mode strict`，
+此时没有验证命令仍会抛出 `VerificationRequiredError`。验证工具缺失、审批被拒、沙箱
+不可用和已执行检查失败不属于“未配置”，两种模式都会继续阻断完成或要求模型修复。
+
 成功执行 `write_file`、`apply_patch`、`delete_file` 或可能改变工作区的
 `run_command` 后，Agent 核心会设置强制验证状态。模型给出最终回答时，核心先自动
 执行一次 `verify_project(kind="all")`：通过后才接受并保存最终回答；检查失败会把
-结果写回对话供模型继续修复；没有可用检查、验证权限被拒绝或验证工具不可用时，
-核心抛出 `VerificationRequiredError`，不会把未验证回答当作完成。该状态可从 SQLite
-工具历史恢复，因此重启进程或继续持久会话也不能绕过验证门。
+结果写回对话供模型继续修复；没有可用检查时按上述 verification mode 处理，验证权限
+被拒绝或验证工具不可用时仍抛出 `VerificationRequiredError`。该状态和未验证原因可从
+SQLite 工具历史恢复，因此重启进程或继续持久会话不会丢失验证状态。
 
 文件变更工具遵循以下约束：
 
@@ -337,7 +358,11 @@ Python 自动发现不再仅因存在 `pyproject.toml` 就假定已安装 `pytho
 - `apply_patch` 使用 `old_text` / `new_text` 做精确文本替换，默认要求旧文本恰好出现
   一次；`expected_replacements` 可明确指定次数。计数不符时文件保持不变。
 - `delete_file` 只永久删除单个普通文件，不删除目录、符号链接或工作区外路径；可传入
-  `expected_sha256`，避免删除内容与预期不符的文件。
+  `expected_sha256`，避免删除内容与预期不符的文件。删除默认拒绝超过 64 MiB 的文件，
+  且删除前哈希遵守 30 秒文件操作时限。
+
+`web_search` 和 `fetch_webpage` 使用默认 15 秒端到端时限，覆盖 DNS、HTTPS 传输、响应
+读取和全部重定向，而不是为每个阶段重新计时。
 
 创建和修改先在目标目录写入临时文件，再原子发布；单次写入默认限制为 1 MiB。
 `.git` 仓库元数据、`.coding-agent` 会话状态目录和
@@ -416,7 +441,7 @@ python -m unittest discover -s tests -v
 ## 当前边界
 
 - CLI 支持使用 `--session-id` 继续历史会话；尚未提供会话列表命令
-- TUI 当前按完整模型响应更新，尚未提供 token/命令输出流式显示和进程取消
+- TUI 已显示模型轮次、当前工具和阶段耗时；尚未提供 token/命令输出流式显示和进程取消
 - CLI 命令默认使用 OS 级容器隔离；显式 `--sandbox off` 或直接使用未注入容器后端的
   Python API 时，结果会返回 `sandboxed=false`，此模式不应用于不可信仓库
 - 容器不是虚拟机安全边界；仍需信任 Docker/Podman、OCI 运行时、内核与指定镜像，

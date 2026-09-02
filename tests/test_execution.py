@@ -4,15 +4,19 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from coding_agent.errors import SandboxUnavailableError, ToolArgumentsError
 from coding_agent.execution import (
+    CommandSpec,
     ContainerSandbox,
     ControlledCommandRunner,
+    _collect_after_timeout,
     discover_container_sandbox,
     discover_verification_plan,
+    run_verification_plan,
 )
 from coding_agent.policy import VERIFICATION_CONFIG_NAME
 
@@ -202,6 +206,79 @@ argv = ["sh", "-c", "exit 0"]
 
         with self.assertRaisesRegex(ToolArgumentsError, "not allowlisted"):
             discover_verification_plan(self.workspace, "all")
+
+    def test_verification_plan_has_a_total_time_budget(self) -> None:
+        class RecordingRunner:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def run(self, argv, *, cwd=".", timeout_s=120):
+                del argv, cwd
+                self.timeouts.append(timeout_s)
+                return {
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "cleanup_incomplete": False,
+                }
+
+        runner = RecordingRunner()
+        plan = [
+            CommandSpec(("python", "-V"), label="test"),
+            CommandSpec(("python", "-V"), label="build"),
+        ]
+        with (
+            patch("coding_agent.execution.discover_verification_plan", return_value=plan),
+            patch(
+                "coding_agent.execution.time.monotonic",
+                side_effect=[0.0, 0.5, 2.0, 2.1, 2.2],
+            ),
+        ):
+            result = run_verification_plan(  # type: ignore[arg-type]
+                runner,
+                self.workspace,
+                kind="all",
+                timeout_s=10,
+                total_timeout_s=1,
+            )
+
+        self.assertEqual(len(runner.timeouts), 1)
+        self.assertLessEqual(runner.timeouts[0], 0.5)
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["complete"])
+
+    def test_timeout_cleanup_never_uses_an_unbounded_communicate(self) -> None:
+        class StuckProcess:
+            def __init__(self) -> None:
+                self.stdout = StringIO()
+                self.stderr = StringIO()
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                self.last_timeout = timeout
+                raise subprocess.TimeoutExpired(["python"], timeout)
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = StuckProcess()
+        initial = subprocess.TimeoutExpired(
+            ["python"],
+            1,
+            output="partial stdout",
+            stderr="partial stderr",
+        )
+        with patch("coding_agent.execution._terminate_process_tree"):
+            stdout, stderr, incomplete = _collect_after_timeout(  # type: ignore[arg-type]
+                process,
+                initial,
+                cleanup_timeout_s=0.01,
+            )
+
+        self.assertEqual(stdout, "partial stdout")
+        self.assertEqual(stderr, "partial stderr")
+        self.assertTrue(incomplete)
+        self.assertTrue(process.killed)
+        self.assertEqual(process.last_timeout, 0.01)
 
 
 if __name__ == "__main__":

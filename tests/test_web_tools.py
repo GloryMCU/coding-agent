@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Mapping
 
 from coding_agent.model import ToolCall
+from coding_agent.errors import WebAccessError
 from coding_agent.tools import create_workspace_registry
 from coding_agent.web_tools import (
     HttpResponse,
@@ -158,6 +160,44 @@ class WebSearchTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(Exception, "rate limit exceeded"):
             failed.search("test")
+
+    def test_dns_resolution_has_a_hard_total_timeout(self) -> None:
+        released = threading.Event()
+
+        def blocking_resolver(hostname: str, port: int) -> list[str]:
+            del hostname, port
+            released.wait(timeout=2)
+            return ["93.184.216.34"]
+
+        client = WebAccessClient(
+            timeout_s=0.02,
+            resolver=blocking_resolver,
+            transport=FakeTransport(),
+        )
+        try:
+            with self.assertRaisesRegex(WebAccessError, "DNS resolution"):
+                client.search("test")
+        finally:
+            released.set()
+
+    def test_custom_transport_cannot_exceed_total_timeout(self) -> None:
+        released = threading.Event()
+
+        def blocking_transport(*args, **kwargs) -> HttpResponse:
+            del args, kwargs
+            released.wait(timeout=2)
+            return HttpResponse(200, {"content-type": "application/json"}, b"{}")
+
+        client = WebAccessClient(
+            timeout_s=0.02,
+            resolver=fake_resolver,
+            transport=blocking_transport,
+        )
+        try:
+            with self.assertRaisesRegex(WebAccessError, "HTTPS request"):
+                client.search("test")
+        finally:
+            released.set()
 
 
 class FetchWebpageTests(unittest.TestCase):

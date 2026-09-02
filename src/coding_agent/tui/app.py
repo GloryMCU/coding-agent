@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from pathlib import Path
+from time import monotonic
 from typing import Any, Callable, TypeAlias
 
 from rich.markdown import Markdown
@@ -128,6 +129,7 @@ class CodingAgentApp(App[None]):
         workspace: str | Path,
         model_name: str,
         approval_mode: str = "workspace",
+        approval_timeout_s: float = 300,
         session_id: str | None = None,
         initial_prompt: str | None = None,
     ) -> None:
@@ -136,10 +138,13 @@ class CodingAgentApp(App[None]):
             raise ValueError(
                 "approval_mode must be workspace, ask, deny, or allow"
             )
+        if approval_timeout_s <= 0:
+            raise ValueError("approval_timeout_s must be positive")
         self.agent_factory = agent_factory
         self.workspace = Path(workspace).resolve()
         self.model_name = model_name
         self.approval_mode = approval_mode
+        self.approval_timeout_s = approval_timeout_s
         self.session_id = session_id
         self.initial_prompt = initial_prompt
         self.agent: Agent | None = None
@@ -148,6 +153,8 @@ class CodingAgentApp(App[None]):
         self.busy = False
         self.completed_tools = 0
         self.last_assistant_text: str | None = None
+        self._activity_label = "Ready"
+        self._activity_started_at: float | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -175,13 +182,17 @@ class CodingAgentApp(App[None]):
         event_sink = TuiEventSink(self)
         reviewer: ApprovalPolicy | None = None
         if self.approval_mode in {"workspace", "ask"}:
-            self.tui_approval = TuiApprovalPolicy(self)
+            self.tui_approval = TuiApprovalPolicy(
+                self,
+                timeout_s=self.approval_timeout_s,
+            )
             reviewer = self.tui_approval
         approval_policy = create_approval_policy(
             self.approval_mode,
             reviewer=reviewer,
         )
         self.agent = self.agent_factory(event_sink, approval_policy)
+        self.set_interval(1.0, self._refresh_activity_elapsed)
         self._refresh_context()
         self._conversation().write(
             Text.from_markup(
@@ -245,6 +256,23 @@ class CodingAgentApp(App[None]):
             self._write_message("You", str(payload.get("content", "")), "cyan")
             return
 
+        if event_type == "model_request_started":
+            step = payload.get("step", "?")
+            max_steps = payload.get("max_steps")
+            step_label = f"Model step {step}"
+            if max_steps is not None:
+                step_label += f"/{max_steps}"
+            phase = (
+                "finalizing response"
+                if payload.get("finalizing")
+                else "waiting for model"
+            )
+            self._set_activity(
+                f"{step_label} · {phase}",
+                track_elapsed=True,
+            )
+            return
+
         if event_type == "model_response":
             if payload.get("provisional"):
                 self._set_activity("Verifying project…")
@@ -268,20 +296,37 @@ class CodingAgentApp(App[None]):
             ok = bool(payload.get("ok"))
             name = str(payload.get("name", "tool"))
             self.completed_tools += 1
+            duration = _format_duration(payload.get("duration_ms"))
             if ok:
                 self._set_activity(
                     f"Working…  ·  {self.completed_tools} tool"
                     f"{'s' if self.completed_tools != 1 else ''} completed"
+                    f" · last took {duration}"
                 )
             else:
-                self._set_activity(f"Tool failed · {_friendly_tool_name(name)}")
+                self._set_activity(
+                    f"Tool failed · {_friendly_tool_name(name)} · after {duration}"
+                )
+            return
+
+        if event_type == "tool_started":
+            name = str(payload.get("name", "tool"))
+            step = payload.get("step", "?")
+            completed = (
+                f" · {self.completed_tools} completed" if self.completed_tools else ""
+            )
+            self._set_activity(
+                f"Model step {step} · {_friendly_tool_name(name)}{completed}",
+                track_elapsed=True,
+            )
             return
 
         if event_type == "model_request_error":
             attempt = payload.get("attempt", "?")
             if payload.get("will_retry"):
                 self._set_activity(
-                    f"Model request failed · retrying after attempt {attempt}…"
+                    f"Model request failed · retrying after attempt {attempt}…",
+                    track_elapsed=True,
                 )
             else:
                 self._set_activity(
@@ -310,7 +355,10 @@ class CodingAgentApp(App[None]):
         request: PermissionRequest,
         future: Future[ApprovalDecision],
     ) -> None:
-        self._set_activity(f"Waiting for approval · {request.tool_name}")
+        self._set_activity(
+            f"Waiting for approval · {_friendly_tool_name(request.tool_name)}",
+            track_elapsed=True,
+        )
 
         def resolved(decision: ApprovalDecision | None) -> None:
             decision = decision or ApprovalDecision.DENY
@@ -322,6 +370,14 @@ class CodingAgentApp(App[None]):
             )
 
         self.push_screen(ApprovalScreen(request), resolved)
+
+    def expire_approval(self, request: PermissionRequest) -> None:
+        if isinstance(self.screen, ApprovalScreen):
+            self.screen.dismiss(ApprovalDecision.DENY)
+        self._set_activity(
+            f"Approval timed out · {_friendly_tool_name(request.tool_name)}"
+        )
+        self.notify("Approval timed out and was denied.", severity="warning")
 
     def action_clear_conversation(self) -> None:
         self._conversation().clear()
@@ -394,14 +450,24 @@ class CodingAgentApp(App[None]):
         if self.is_mounted:
             self._prompt().disabled = busy
             if busy:
-                self._set_activity(activity)
+                self._set_activity(activity, track_elapsed=True)
             else:
                 self._set_activity(
                     f"{activity}  ·  Enter send  ·  Shift+Enter new line"
                 )
 
-    def _set_activity(self, activity: str) -> None:
+    def _set_activity(self, activity: str, *, track_elapsed: bool = False) -> None:
+        self._activity_label = activity
+        self._activity_started_at = monotonic() if track_elapsed else None
         self.query_one("#activity", Static).update(activity)
+
+    def _refresh_activity_elapsed(self) -> None:
+        if self._activity_started_at is None:
+            return
+        elapsed_seconds = max(0, int(monotonic() - self._activity_started_at))
+        self.query_one("#activity", Static).update(
+            f"{self._activity_label} · {_format_elapsed(elapsed_seconds)} elapsed"
+        )
 
     def _refresh_context(self) -> None:
         session = self.session_id[:8] if self.session_id else "new"
@@ -451,3 +517,18 @@ def _tool_activity(names: list[str], completed: int) -> str:
         current = f"Using {len(names)} tools"
     prefix = f"{completed} completed  ·  " if completed else ""
     return f"Working…  ·  {prefix}{current}"
+
+
+def _format_elapsed(seconds: int) -> str:
+    minutes, seconds = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _format_duration(duration_ms: Any) -> str:
+    if not isinstance(duration_ms, (int, float)) or isinstance(duration_ms, bool):
+        return "unknown time"
+    if duration_ms < 1000:
+        return f"{max(0, round(duration_ms))}ms"
+    return f"{duration_ms / 1000:.1f}s"

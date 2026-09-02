@@ -350,17 +350,21 @@ class ContextBuilder:
     def _project_assistant(stored: StoredMessage) -> list[Message]:
         text_parts = [part for part in stored.parts if part.type == "text"]
         text = "".join(part.data.get("text", "") for part in text_parts)
+        reasoning_parts = [
+            part for part in stored.parts if part.type == "reasoning"
+        ]
         reasoning = "".join(
             part.data.get("text", "")
-            for part in stored.parts
-            if part.type == "reasoning"
+            for part in reasoning_parts
         )
         tool_parts = [part for part in stored.parts if part.type == "tool"]
         assistant: Message = {
             "role": "assistant",
             "content": text if text_parts else None,
         }
-        if reasoning:
+        # Field presence matters to thinking-mode APIs even when a synthetic
+        # tool call has no reasoning text of its own.
+        if reasoning_parts:
             assistant["reasoning_content"] = reasoning
         if tool_parts:
             assistant["tool_calls"] = [

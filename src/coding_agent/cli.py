@@ -101,6 +101,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--approval-timeout-s",
+        type=float,
+        default=300.0,
+        help="TUI approval timeout in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--verification-mode",
+        choices=("available", "strict"),
+        default="available",
+        help=(
+            "Verification policy: available permits an explicitly unverified "
+            "handoff when no check is configured; strict blocks it "
+            "(default: available)"
+        ),
+    )
+    parser.add_argument(
         "--sandbox",
         choices=("required", "off"),
         default="required",
@@ -245,6 +261,7 @@ def main() -> int:
                 max_context_tokens=args.max_context_tokens,
                 context_summary_tokens=args.context_summary_tokens,
                 history_search_limit=args.history_search_limit,
+                verification_mode=args.verification_mode,
             ),
             events=CompositeEventSink(audit_events, events),
             store=SqliteConversationStore(database_path),
@@ -266,6 +283,7 @@ def main() -> int:
             workspace=workspace,
             model_name=DeepSeekV4ProClient.MODEL,
             approval_mode=args.approval_mode,
+            approval_timeout_s=args.approval_timeout_s,
             session_id=args.session_id,
             initial_prompt=args.prompt,
         )
